@@ -3,6 +3,7 @@ import io
 import datetime
 import subprocess
 import threading
+import tempfile
 import whisper
 import gspread
 from fastapi import FastAPI, BackgroundTasks
@@ -10,7 +11,6 @@ from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from moviepy.editor import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 import json
 import base64
 
@@ -19,20 +19,19 @@ app = FastAPI()
 # ============================================================
 # CONFIGURATION (via variables d'environnement sur Render)
 # ============================================================
-MASTER_SHEET_URL  = os.environ.get("MASTER_SHEET_URL", "https://docs.google.com/spreadsheets/d/1tlB7auPNU_fXUiuIbI-5EbmizInw4rw35tB2SWEvPas/edit")
-VIDEOS_SHEET_URL  = os.environ.get("VIDEOS_SHEET_URL", "https://docs.google.com/spreadsheets/d/13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g/edit")
-HOOKS_FOLDER_ID   = os.environ.get("HOOKS_FOLDER_ID",   "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
-RESULTS_FOLDER_ID = os.environ.get("RESULTS_FOLDER_ID", "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
-PART2_FILE_ID     = os.environ.get("PART2_FILE_ID",     "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
-DEFAULT_TITLE     = os.environ.get("DEFAULT_TITLE",     "The danger no\none told you about")
+MASTER_SHEET_URL    = os.environ.get("MASTER_SHEET_URL",    "https://docs.google.com/spreadsheets/d/1tlB7auPNU_fXUiuIbI-5EbmizInw4rw35tB2SWEvPas/edit")
+VIDEOS_SHEET_URL    = os.environ.get("VIDEOS_SHEET_URL",    "https://docs.google.com/spreadsheets/d/13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g/edit")
+HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
+RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
+PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
+DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no\none told you about")
 VIDEOS_PER_CAMPAIGN = int(os.environ.get("VIDEOS_PER_CAMPAIGN", "20"))
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN",    "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID",  "1687730801")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")  # JSON du service account en base64
+TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
+GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
-# Verrou pour éviter deux montages en parallèle
 processing_lock = threading.Lock()
 is_processing = False
 
@@ -53,7 +52,7 @@ def get_google_services():
     return drive_service, gc
 
 # ============================================================
-# FONCTIONS DRIVE (avec supportsAllDrives=True pour Shared Drives)
+# FONCTIONS DRIVE
 # ============================================================
 def drive_list_videos(drive_service, folder_id):
     q = f"'{folder_id}' in parents and trashed = false"
@@ -171,14 +170,71 @@ def load_titles_from_sheet(gc):
         return []
 
 # ============================================================
-# MONTAGE VIDÉO
+# FFMPEG : obtenir la durée d'une vidéo
+# ============================================================
+def get_video_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True
+    )
+    return float(result.stdout.strip())
+
+# ============================================================
+# FFMPEG : détecter start/end de la parole via Whisper
+# ============================================================
+def get_speech_bounds(model, video_path, video_duration):
+    result = model.transcribe(video_path, word_timestamps=True)
+    words = []
+    for segment in result.get("segments", []):
+        words.extend(segment.get("words", []))
+    if words:
+        start_t = max(0, words[0]["start"] - 0.1)
+        end_t = min(words[-1]["end"] + 0.8, video_duration - 0.05)
+    else:
+        start_t, end_t = 0, video_duration
+    return start_t, end_t, result
+
+# ============================================================
+# FFMPEG : générer les sous-titres au format SRT
+# ============================================================
+def generate_srt(model, audio_path):
+    result = model.transcribe(audio_path, word_timestamps=True)
+    words_all = []
+    for segment in result.get("segments", []):
+        words_all.extend(segment.get("words", []))
+
+    srt_lines = []
+    idx = 1
+    chunk = []
+    for i, w in enumerate(words_all):
+        chunk.append(w)
+        if len(chunk) >= 5 or i == len(words_all) - 1:
+            start = chunk[0]["start"]
+            end = chunk[-1]["end"]
+            text = " ".join([x["word"].strip() for x in chunk]).lstrip(",. ")
+
+            def fmt(t):
+                h = int(t // 3600)
+                m = int((t % 3600) // 60)
+                s = int(t % 60)
+                ms = int((t - int(t)) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+            srt_lines.append(f"{idx}\n{fmt(start)} --> {fmt(end)}\n{text}\n")
+            idx += 1
+            chunk = []
+
+    return "\n".join(srt_lines)
+
+# ============================================================
+# MONTAGE PRINCIPAL VIA FFMPEG PUR
 # ============================================================
 def process_videos():
     global is_processing
     now = datetime.datetime.now()
     date_du_jour = now.strftime("%d.%m")
     day_month_slash = now.strftime("%d/%m")
-    temp_audio = "/tmp/temp_audio.m4a"
     local_part2 = "/tmp/partie2.mp4"
 
     try:
@@ -186,7 +242,7 @@ def process_videos():
         master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
         titles_from_sheet = load_titles_from_sheet(gc)
 
-        # Préparer les dossiers
+        # Préparer les dossiers Drive
         today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
         edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
         original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
@@ -195,11 +251,9 @@ def process_videos():
         if os.path.exists(local_part2):
             os.remove(local_part2)
         drive_download_file(drive_service, PART2_FILE_ID, local_part2)
-        video_fixe = VideoFileClip(local_part2)
 
         # Lister les vidéos dans HOOKS
         hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
-
         if not hook_files:
             send_telegram("✅ *Video Editor* — Aucune vidéo dans HOOKS. Rien à traiter.")
             return
@@ -214,8 +268,13 @@ def process_videos():
             hook_id   = f["id"]
             hook_name = f["name"]
             nom_final = f"{date_du_jour}_V{index}.mp4"
-            local_hook = f"/tmp/{hook_name}"
-            local_out  = f"/tmp/{nom_final}"
+            local_hook     = f"/tmp/hook_{index}.mp4"
+            local_hook_cut = f"/tmp/hook_cut_{index}.mp4"
+            local_concat   = f"/tmp/concat_{index}.mp4"
+            local_audio    = f"/tmp/audio_{index}.wav"
+            local_srt      = f"/tmp/subs_{index}.srt"
+            local_out      = f"/tmp/out_{index}.mp4"
+            concat_list    = f"/tmp/list_{index}.txt"
 
             # Titre dynamique
             if index - 1 < len(titles_from_sheet):
@@ -223,62 +282,77 @@ def process_videos():
             else:
                 video_title = DEFAULT_TITLE
 
-            full_hook = None
-            final = None
-
             try:
+                # 1. Télécharger le hook
                 drive_download_file(drive_service, hook_id, local_hook)
-                full_hook = VideoFileClip(local_hook)
+                hook_duration = get_video_duration(local_hook)
 
-                # Whisper pour détecter les limites de parole
-                result = model.transcribe(local_hook, word_timestamps=True)
-                words = []
-                for segment in result.get("segments", []):
-                    words.extend(segment.get("words", []))
-                if words:
-                    start_t = max(0, words[0]["start"] - 0.1)
-                    end_t = min(words[-1]["end"] + 0.8, full_hook.duration - 0.05)
+                # 2. Détecter les bornes de parole
+                start_t, end_t, _ = get_speech_bounds(model, local_hook, hook_duration)
+
+                # 3. Couper le hook
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", local_hook,
+                    "-ss", str(start_t), "-to", str(end_t),
+                    "-c", "copy", local_hook_cut
+                ], check=True, capture_output=True)
+
+                # 4. Concaténer hook + part2
+                with open(concat_list, "w") as cl:
+                    cl.write(f"file '{local_hook_cut}'\n")
+                    cl.write(f"file '{local_part2}'\n")
+
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", concat_list,
+                    "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
+                    local_concat
+                ], check=True, capture_output=True)
+
+                # 5. Extraire l'audio pour Whisper
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", local_concat,
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    local_audio
+                ], check=True, capture_output=True)
+
+                # 6. Générer les sous-titres SRT
+                srt_content = generate_srt(model, local_audio)
+                with open(local_srt, "w", encoding="utf-8") as sf:
+                    sf.write(srt_content)
+
+                # 7. Brûler les sous-titres + titre overlay avec FFmpeg
+                # Titre en overlay pendant 4 secondes (boîte blanche avec texte noir)
+                title_escaped = video_title.replace("'", "\\'").replace(":", "\\:").replace("\n", " ")
+                font_path_escaped = FONT_PATH.replace(":", "\\:")
+
+                # Vérifier si la police Montserrat existe
+                if os.path.exists(FONT_PATH):
+                    font_arg = f"fontfile={font_path_escaped}:fontcolor=black:fontsize=55"
                 else:
-                    start_t, end_t = 0, full_hook.duration
+                    font_arg = "fontcolor=black:fontsize=55"
 
-                hook = full_hook.subclip(start_t, end_t)
-                video_fusionnee = concatenate_videoclips([hook, video_fixe], method="compose")
-                video_fusionnee.audio.write_audiofile(temp_audio, fps=44100, codec="aac", verbose=False, logger=None)
+                # Filtre FFmpeg : sous-titres + titre overlay
+                vf_filter = (
+                    f"subtitles={local_srt}:force_style='FontSize=28,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=80',"
+                    f"drawbox=x=(W-tw)/2-20:y=780-10:w=tw+40:h=th+20:color=white@1.0:t=fill:enable='lt(t,4)',"
+                    f"drawtext=text='{title_escaped}':{font_arg}:x=(w-tw)/2:y=790:enable='lt(t,4)'"
+                )
 
-                # Sous-titres automatiques (Whisper)
-                result2 = model.transcribe(temp_audio, word_timestamps=True)
-                words_all = []
-                for segment in result2.get("segments", []):
-                    words_all.extend(segment.get("words", []))
-                subs = []
-                current_chunk = []
-                for i2, word_data in enumerate(words_all):
-                    current_chunk.append(word_data)
-                    if len(current_chunk) >= 5 or i2 == len(words_all) - 1:
-                        text_str = " ".join([w["word"].strip() for w in current_chunk]).lstrip(",. ")
-                        txt = TextClip(text_str, fontsize=34, color="white", bg_color="black", font="Arial", method="label")
-                        txt = (txt.set_start(current_chunk[0]["start"])
-                                .set_duration(current_chunk[-1]["end"] - current_chunk[0]["start"])
-                                .set_position(("center", 965)))
-                        subs.append(txt)
-                        current_chunk = []
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", local_concat,
+                    "-vf", vf_filter,
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-preset", "fast", "-crf", "23",
+                    "-movflags", "+faststart",
+                    local_out
+                ], check=True, capture_output=True)
 
-                # Titre dynamique en overlay
-                t1 = TextClip(
-                    video_title,
-                    fontsize=70, color="black", bg_color="white",
-                    font="Montserrat-Bold", method="label",
-                    align="Center", stroke_width=1.5, interline=-10
-                ).set_start(0).set_duration(4).set_position(("center", 780))
-
-                final = CompositeVideoClip([video_fusionnee] + subs + [t1])
-                final.write_videofile(local_out, fps=24, codec="libx264", audio_codec="aac", logger=None)
-
-                # Upload
+                # 8. Upload vers Drive
                 out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
                 drive_move_file(drive_service, hook_id, original_folder_id)
 
-                # Log dans le Master Sheet
+                # 9. Log dans le Master Sheet
                 existing_before = count_videos_in_drive_folder(drive_service, edited_folder_id) - 1
                 version = (existing_before // VIDEOS_PER_CAMPAIGN) + 1
                 campaign_name = f"C{version}_{day_month_slash}"
@@ -290,21 +364,19 @@ def process_videos():
                 )
 
                 success_count += 1
+                print(f"✅ {nom_final} monté avec succès")
 
             except Exception as e:
                 error_count += 1
-                print(f"Erreur sur {hook_name}: {e}")
+                print(f"❌ Erreur sur {hook_name}: {e}")
 
             finally:
-                for path in [local_hook, local_out, temp_audio]:
-                    if os.path.exists(path):
-                        os.remove(path)
-                if final:
-                    final.close()
-                if full_hook:
-                    full_hook.close()
-
-        video_fixe.close()
+                for path in [local_hook, local_hook_cut, local_concat, local_audio, local_srt, local_out, concat_list]:
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except:
+                        pass
 
         # Rapport final Telegram
         msg = f"🚀 *Video Editor — Mission accomplie!*\n\n"

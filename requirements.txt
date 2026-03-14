@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 openai-whisper
-moviepy==1.0.3
 gspread
 google-auth
 google-api-python-client

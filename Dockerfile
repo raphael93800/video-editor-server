@@ -1,11 +1,15 @@
 FROM python:3.11-slim
 
 # Installer FFmpeg et les dépendances système
-RUN apt-get update && apt-get install -y \
+RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
     ffmpeg \
+    fontconfig \
     fonts-open-type \
     wget \
     curl \
+    libgl1 \
+    libglib2.0-0 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Installer la police Montserrat Bold

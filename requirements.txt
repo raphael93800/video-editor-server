@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+openai-whisper
+moviepy
+gspread
+google-auth
+google-api-python-client
+google-auth-httplib2
+requests

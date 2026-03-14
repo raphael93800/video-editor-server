@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: video-editor
+    env: python
+    buildCommand: |
+      pip install -r requirements.txt
+      apt-get update -y && apt-get install -y ffmpeg fonts-open-type
+      mkdir -p /usr/share/fonts/truetype/custom
+      fc-cache -f -v
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: standard

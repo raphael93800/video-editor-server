@@ -53,7 +53,7 @@ def get_google_services():
     return drive_service, gc
 
 # ============================================================
-# FONCTIONS DRIVE
+# FONCTIONS DRIVE (avec supportsAllDrives=True pour Shared Drives)
 # ============================================================
 def drive_list_videos(drive_service, folder_id):
     q = f"'{folder_id}' in parents and trashed = false"
@@ -62,7 +62,9 @@ def drive_list_videos(drive_service, folder_id):
     while True:
         resp = drive_service.files().list(
             q=q, fields="nextPageToken, files(id, name)",
-            pageToken=page_token, pageSize=1000
+            pageToken=page_token, pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
         out.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
@@ -73,7 +75,7 @@ def drive_list_videos(drive_service, folder_id):
     return out
 
 def drive_download_file(drive_service, file_id, local_path):
-    request = drive_service.files().get_media(fileId=file_id)
+    request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.FileIO(local_path, "wb")
     downloader = MediaIoBaseDownload(fh, request)
     done = False
@@ -82,23 +84,36 @@ def drive_download_file(drive_service, file_id, local_path):
 
 def drive_get_or_create_folder(drive_service, parent_id, folder_name):
     q = f"'{parent_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}'"
-    resp = drive_service.files().list(q=q, fields="files(id,name)").execute()
+    resp = drive_service.files().list(
+        q=q, fields="files(id,name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
     files = resp.get("files", [])
     if files:
         return files[0]["id"]
     meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    created = drive_service.files().create(body=meta, fields="id").execute()
+    created = drive_service.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     return created["id"]
 
 def drive_move_file(drive_service, file_id, new_parent_id):
-    file_meta = drive_service.files().get(fileId=file_id, fields="parents").execute()
+    file_meta = drive_service.files().get(
+        fileId=file_id, fields="parents", supportsAllDrives=True
+    ).execute()
     old_parents = ",".join(file_meta.get("parents", []))
-    drive_service.files().update(fileId=file_id, addParents=new_parent_id, removeParents=old_parents).execute()
+    drive_service.files().update(
+        fileId=file_id,
+        addParents=new_parent_id,
+        removeParents=old_parents,
+        supportsAllDrives=True
+    ).execute()
 
 def drive_upload_video(drive_service, local_path, parent_id, filename):
     media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True)
     meta = {"name": filename, "parents": [parent_id]}
-    created = drive_service.files().create(body=meta, media_body=media, fields="id").execute()
+    created = drive_service.files().create(
+        body=meta, media_body=media, fields="id", supportsAllDrives=True
+    ).execute()
     return created["id"]
 
 def make_drive_links(file_id):
@@ -108,7 +123,11 @@ def make_drive_links(file_id):
 
 def count_videos_in_drive_folder(drive_service, folder_id):
     q = f"'{folder_id}' in parents and trashed = false"
-    resp = drive_service.files().list(q=q, fields="files(id,name)").execute()
+    resp = drive_service.files().list(
+        q=q, fields="files(id,name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
+    ).execute()
     return len([f for f in resp.get("files", []) if f["name"].lower().endswith((".mp4", ".mov"))])
 
 # ============================================================
@@ -152,7 +171,7 @@ def load_titles_from_sheet(gc):
         return []
 
 # ============================================================
-# MONTAGE VIDÉO (même logique que ton script Colab)
+# MONTAGE VIDÉO
 # ============================================================
 def process_videos():
     global is_processing
@@ -318,5 +337,9 @@ def trigger_processing(background_tasks: BackgroundTasks):
     return JSONResponse({"status": "started", "message": "Montage démarré en arrière-plan"})
 
 @app.get("/status")
-def get_status():
+def status():
     return {"processing": is_processing}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

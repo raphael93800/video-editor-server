@@ -234,7 +234,7 @@ def generate_srt(model, audio_path):
     chunk = []
     for i, w in enumerate(words_all):
         chunk.append(w)
-        if len(chunk) >= 5 or i == len(words_all) - 1:
+        if len(chunk) >= 4 or i == len(words_all) - 1:
             start = chunk[0]["start"]
             end = chunk[-1]["end"]
             text = " ".join([x["word"].strip() for x in chunk]).lstrip(",. ")
@@ -251,6 +251,63 @@ def generate_srt(model, audio_path):
             chunk = []
 
     return "\n".join(srt_lines)
+
+
+# ============================================================
+# Construire les filtres drawtext pour les sous-titres
+# ============================================================
+def build_subtitle_drawtext_filters(srt_path, hook_duration, font_path):
+    """Parse le SRT et génère des filtres drawtext FFmpeg.
+    Les timestamps du SRT sont déjà décalés de +hook_duration.
+    Police : LiberationSans-Bold (toujours disponible).
+    Position : 90px depuis le bas, centré horizontalement.
+    Taille : 18px réels sur 720x1280.
+    """
+    import re as _re
+
+    # Police disponible sur Render
+    if os.path.exists(font_path):
+        font_arg = f"fontfile={font_path.replace(':', chr(92) + ':')}"
+    else:
+        font_arg = "fontfile=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+
+    with open(srt_path, encoding="utf-8") as f:
+        content = f.read()
+
+    blocks = _re.split(r'\n\n+', content.strip())
+    filters = []
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 3:
+            continue
+        m = _re.match(r'(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})', lines[1])
+        if not m:
+            continue
+        def ts2s(ts):
+            h, mn, s_ms = ts.split(':')
+            s, ms = s_ms.split(',')
+            return int(h)*3600 + int(mn)*60 + int(s) + int(ms)/1000
+        start = ts2s(m.group(1))
+        end = ts2s(m.group(2))
+        text = ' '.join(lines[2:]).strip()
+        # Échapper les caractères spéciaux pour FFmpeg drawtext
+        text_esc = (text
+            .replace('\\', '\\\\')
+            .replace("'", "\u2019")  # apostrophe typographique
+            .replace(':', '\\:')
+            .replace(',', '\\,')
+            .replace('[', '\\[')
+            .replace(']', '\\]')
+            .replace('%', '%%')
+        )
+        f_str = (
+            f"drawtext={font_arg}:text='{text_esc}':"
+            f"fontcolor=white:fontsize=18:x=(w-tw)/2:y=h-90:"
+            f"bordercolor=black:borderw=2:"
+            f"enable='between(t,{start},{end})'"
+        )
+        filters.append(f_str)
+    return filters
 
 # ============================================================
 # MONTAGE PRINCIPAL VIA FFMPEG PUR
@@ -381,20 +438,14 @@ def process_videos():
                 print(f"📝 Sous-titres générés")
 
                 # 11. Brûler les sous-titres + titre overlay avec FFmpeg
-                # Mesures exactes issues de la vidéo de référence (720x1280) :
-                # Fond blanc titre : x=72, y=705, w=573, h=114
-                # Texte titre : fontsize=36, noir, centré horizontalement
-                # Sous-titres : FontSize=28, blanc avec contour noir, MarginV=180 (y~1100)
-
                 # Couper le titre en 2 lignes si trop long (max ~22 chars par ligne)
                 title_clean = video_title.replace("\n", " ").strip()
-                words = title_clean.split()
+                words_t = title_clean.split()
                 line1, line2 = "", ""
-                mid = len(words) // 2
-                # Essayer de couper au milieu des mots
-                for cut in range(mid, len(words)):
-                    candidate1 = " ".join(words[:cut])
-                    candidate2 = " ".join(words[cut:])
+                mid = len(words_t) // 2
+                for cut in range(mid, len(words_t)):
+                    candidate1 = " ".join(words_t[:cut])
+                    candidate2 = " ".join(words_t[cut:])
                     if len(candidate1) <= 22:
                         line1, line2 = candidate1, candidate2
                         break
@@ -403,39 +454,40 @@ def process_videos():
                     line2 = ""
 
                 def esc(s):
-                    return s.replace("'", "\\'").replace(":", "\\:").replace("%", "%%")
+                    return (s.replace("\\", "\\\\")
+                             .replace("'", "\u2019")
+                             .replace(":", "\\:")
+                             .replace("%", "%%"))
 
-                # Vérifier si la police Montserrat existe
-                font_path_esc = FONT_PATH.replace(':', '\\:')
+                # Police pour le titre
                 if os.path.exists(FONT_PATH):
+                    font_path_esc = FONT_PATH.replace(':', '\\:')
                     font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=36"
                 else:
                     font_base = "fontcolor=black:fontsize=36"
 
-                # Construire le filtre
+                # Construire le filtre titre
                 if line2:
-                    # 2 lignes : ligne1 y=718, ligne2 y=762
                     title_filter = (
                         f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
                         f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=718:enable='lt(t,4)',"
                         f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=762:enable='lt(t,4)'"
                     )
                 else:
-                    # 1 ligne : centrée verticalement dans le fond (y=750)
                     title_filter = (
                         f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
                         f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=750:enable='lt(t,4)'"
                     )
 
+                # Construire les filtres drawtext pour les sous-titres
+                # Le SRT contient des timestamps relatifs à la vidéo concaténée
+                # (Whisper a transcrit l’audio complet, donc les timestamps incluent déjà le hook)
+                hook_cut_duration = get_video_duration(local_hook_cut)
+                sub_filters = build_subtitle_drawtext_filters(local_srt, hook_cut_duration, FONT_PATH)
+
                 # Filtre complet : titre + sous-titres
-                # Style sous-titres calqué sur la vidéo Facebook de référence :
-                # - Texte blanc GRAS avec contour noir épais (Outline=3)
-                # - Centré horizontalement, position 74% de la hauteur (MarginV=308)
-                # - FontSize=36, pas de fond/rectangle
-                vf_filter = (
-                    title_filter + ","
-                    f"subtitles={local_srt}:force_style='FontSize=36,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=3,Bold=1,Shadow=0,Alignment=2,MarginV=400'"
-                )
+                all_filters = [title_filter] + sub_filters
+                vf_filter = ",".join(all_filters)
 
                 result = subprocess.run([
                     "ffmpeg", "-y", "-i", local_concat,

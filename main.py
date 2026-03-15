@@ -381,19 +381,32 @@ def process_videos():
                 print(f"📝 Sous-titres générés")
 
                 # 11. Brûler les sous-titres + titre overlay avec FFmpeg
-                title_line = video_title.replace("'", "\\'").replace(":", "\\:").replace("\n", " ")
+                # Titre sur 1 ou 2 lignes max, on remplace les sauts de ligne par un espace
+                title_clean = video_title.replace("\n", " ").strip()
+                title_line = title_clean.replace("'", "\\'").replace(":", "\\:").replace("%", "%%")
+
+                # Dimensions vidéo : 720x1280
+                # Fond blanc : x=30, y=640, w=660, h=140 (centré verticalement dans le tiers bas)
+                # Texte noir gras centré dans le fond blanc
+                # Sous-titres : petits (fontsize=16), en bas, discrets avec contour noir
 
                 # Vérifier si la police Montserrat existe
                 font_path_esc = FONT_PATH.replace(':', '\\:')
                 if os.path.exists(FONT_PATH):
-                    font_spec = f"fontfile={font_path_esc}:fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
+                    title_font = f"fontfile={font_path_esc}:fontcolor=black:fontsize=36"
+                    sub_font = f"fontfile={font_path_esc}"
                 else:
-                    font_spec = "fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
+                    title_font = "fontcolor=black:fontsize=36"
+                    sub_font = ""
 
-                # Filtre : sous-titres centrés en bas + titre en haut pendant 4s
+                # Filtre complet :
+                # 1. Fond blanc pour le titre (pendant 4s)
+                # 2. Texte du titre noir centré sur le fond blanc (pendant 4s)
+                # 3. Sous-titres petits en bas (tout le long)
                 vf_filter = (
-                    f"subtitles={local_srt}:force_style='FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=60',"
-                    f"drawtext=text='{title_line}':{font_spec}:x=(w-tw)/2:y=80:enable='lt(t,4)'"
+                    f"drawbox=x=30:y=640:w=660:h=150:color=white@1.0:t=fill:enable='lt(t,4)',"
+                    f"drawtext=text='{title_line}':{title_font}:x=(w-tw)/2:y=695:enable='lt(t,4)',"
+                    f"subtitles={local_srt}:force_style='FontSize=16,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=0,Alignment=2,MarginV=40'"
                 )
 
                 result = subprocess.run([

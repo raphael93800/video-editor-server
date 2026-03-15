@@ -196,11 +196,15 @@ def has_video_stream(path):
 # FFMPEG : ré-encoder proprement une vidéo (fix keyframes)
 # ============================================================
 def reencode_video(input_path, output_path):
-    """Ré-encode la vidéo pour s'assurer qu'elle est bien formée."""
+    """Ré-encode la vidéo en forçant 24fps + 44100Hz stéréo.
+    Critique pour la transition : hook et Part2 DOIVENT avoir exactement
+    les mêmes fps et sample rate pour que FFmpeg concat soit smooth.
+    """
     subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-ar", "44100",
+        "-r", "24",           # Forcer 24fps (identique pour hook ET Part2)
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",  # Stéréo 44100Hz
         "-movflags", "+faststart",
         output_path
     ], check=True, capture_output=True)
@@ -215,8 +219,8 @@ def get_speech_bounds(model, video_path, video_duration):
         words.extend(segment.get("words", []))
     if words:
         start_t = max(0, words[0]["start"] - 0.1)
-        # Couper exactement au dernier mot + 0.1s max (coupure nette, 0 silence)
-        end_t = min(words[-1]["end"] + 0.1, video_duration - 0.05)
+        # +0.8s après le dernier mot comme dans le Colab original
+        end_t = min(words[-1]["end"] + 0.8, video_duration - 0.05)
     else:
         start_t, end_t = 0, video_duration
     return start_t, end_t, result

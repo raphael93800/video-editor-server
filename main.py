@@ -144,30 +144,59 @@ def send_telegram(msg):
         pass
 
 # ============================================================
-# CHARGER LES TITRES DEPUIS LE SHEET
+# CHARGER LES DONNÉES DEPUIS LE SHEET VIDEO IA N8N
 # ============================================================
-def load_titles_from_sheet(gc):
+def load_video_data_from_sheet(gc):
+    """
+    Lit le sheet Video IA n8N et retourne une liste de dicts avec :
+    - title : titre de la vidéo (pour l'overlay)
+    - headline : headline Meta
+    - primary_text : texte principal Meta
+    - video_prompt : prompt utilisé pour générer le hook
+    """
     try:
         videos_ws = gc.open_by_url(VIDEOS_SHEET_URL).sheet1
         all_rows = videos_ws.get_all_values()
         if not all_rows:
             return []
         headers = [h.lower().strip() for h in all_rows[0]]
-        title_col = None
-        for i, h in enumerate(headers):
-            if "title" in h and "video" in h:
-                title_col = i
-                break
-        if title_col is None:
-            return []
-        titles = []
+
+        def find_col(keywords):
+            for i, h in enumerate(headers):
+                if all(k in h for k in keywords):
+                    return i
+            for i, h in enumerate(headers):
+                if any(k in h for k in keywords):
+                    return i
+            return None
+
+        title_col   = find_col(["title"])
+        headline_col = find_col(["headline"])
+        primary_col  = find_col(["primary"])
+        prompt_col   = find_col(["prompt"])
+
+        data = []
         for row in all_rows[1:]:
-            if len(row) > title_col and row[title_col].strip():
-                titles.append(row[title_col].strip())
-        return titles
+            def get(col):
+                if col is not None and len(row) > col:
+                    return row[col].strip()
+                return ""
+            if get(title_col):
+                data.append({
+                    "title":        get(title_col),
+                    "headline":     get(headline_col),
+                    "primary_text": get(primary_col),
+                    "video_prompt": get(prompt_col),
+                })
+        return data
     except Exception as e:
-        print(f"Erreur chargement titres: {e}")
+        print(f"Erreur chargement données sheet: {e}")
         return []
+
+def load_titles_from_sheet(gc):
+    """Compatibilité — retourne juste les titres."""
+    data = load_video_data_from_sheet(gc)
+    return [d["title"] for d in data]
 
 # ============================================================
 # FFMPEG : obtenir la durée d'une vidéo
@@ -344,7 +373,14 @@ def process_videos():
     try:
         drive_service, gc = get_google_services()
         master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
-        titles_from_sheet = load_titles_from_sheet(gc)
+        video_data = load_video_data_from_sheet(gc)
+
+        # Numérotation continue : compter les lignes déjà dans le master sheet
+        existing_rows = master_ws.get_all_values()
+        # Compter les lignes avec données (hors header)
+        existing_count = len([r for r in existing_rows[1:] if r and r[0].strip()]) if len(existing_rows) > 1 else 0
+        start_index = existing_count + 1  # V(existing_count+1), V(existing_count+2)...
+        print(f"📊 Master sheet: {existing_count} vidéos existantes → prochaine numérotation à partir de V{start_index}")
 
         # Préparer les dossiers Drive
         today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
@@ -373,24 +409,32 @@ def process_videos():
         success_count = 0
         error_count = 0
 
-        for index, f in enumerate(hook_files, start=1):
+        for loop_idx, f in enumerate(hook_files, start=0):
+            global_index = start_index + loop_idx  # numérotation continue
             hook_id   = f["id"]
             hook_name = f["name"]
-            nom_final = f"{date_du_jour}_V{index}.mp4"
-            local_hook      = f"/tmp/hook_{index}.mp4"
-            local_hook_clean = f"/tmp/hook_clean_{index}.mp4"
-            local_hook_cut  = f"/tmp/hook_cut_{index}.mp4"
-            local_concat    = f"/tmp/concat_{index}.mp4"
-            local_audio     = f"/tmp/audio_{index}.wav"
-            local_srt       = f"/tmp/subs_{index}.srt"
-            local_out       = f"/tmp/out_{index}.mp4"
-            concat_list     = f"/tmp/list_{index}.txt"
+            nom_final = f"{date_du_jour}_V{global_index}.mp4"
+            local_hook      = f"/tmp/hook_{global_index}.mp4"
+            local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
+            local_hook_cut  = f"/tmp/hook_cut_{global_index}.mp4"
+            local_concat    = f"/tmp/concat_{global_index}.mp4"
+            local_audio     = f"/tmp/audio_{global_index}.wav"
+            local_srt       = f"/tmp/subs_{global_index}.srt"
+            local_out       = f"/tmp/out_{global_index}.mp4"
+            concat_list     = f"/tmp/list_{global_index}.txt"
 
-            # Titre dynamique
-            if index - 1 < len(titles_from_sheet):
-                video_title = titles_from_sheet[index - 1]
+            # Données dynamiques depuis le sheet (titre, headline, primary_text, video_prompt)
+            if loop_idx < len(video_data):
+                vd = video_data[loop_idx]
+                video_title    = vd["title"] or DEFAULT_TITLE
+                video_headline = vd["headline"]
+                video_primary  = vd["primary_text"]
+                video_prompt   = vd["video_prompt"]
             else:
-                video_title = DEFAULT_TITLE
+                video_title    = DEFAULT_TITLE
+                video_headline = ""
+                video_primary  = ""
+                video_prompt   = ""
 
             try:
                 # 1. Télécharger le hook
@@ -539,14 +583,24 @@ def process_videos():
                 out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
                 drive_move_file(drive_service, hook_id, original_folder_id)
 
-                # 14. Log dans le Master Sheet
-                existing_before = count_videos_in_drive_folder(drive_service, edited_folder_id) - 1
-                version = (existing_before // VIDEOS_PER_CAMPAIGN) + 1
-                campaign_name = f"C{version}_{day_month_slash}"
-                adset_name    = f"adset{version}_{day_month_slash}"
+                # 14. Log dans le Master Sheet (toutes les colonnes)
+                # Numérotation campaign/adset basée sur global_index
+                version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+                campaign_name = f"C{date_du_jour}_{version:02d}"
+                adset_name    = f"adset{version}_{date_du_jour}"
                 drive_link, direct_link = make_drive_links(out_id)
                 master_ws.append_row(
-                    [nom_final.replace(".mp4", ""), drive_link, direct_link, campaign_name, adset_name],
+                    [
+                        nom_final.replace(".mp4", ""),  # Ad_Name
+                        drive_link,                      # Drive_Share_Link
+                        direct_link,                     # Direct_Download_Link
+                        campaign_name,                   # Campaign_Name
+                        adset_name,                      # AdSet_Name
+                        video_primary,                   # Primary_Text
+                        video_headline,                  # Headline
+                        video_prompt,                    # Video_Prompt
+                        "ready",                         # status
+                    ],
                     value_input_option="USER_ENTERED"
                 )
 

@@ -428,10 +428,13 @@ def process_videos():
                     )
 
                 # Filtre complet : titre + sous-titres
-                # Sous-titres : FontSize=28, MarginV=180 = y centre ~1100 (comme la référence)
+                # Style sous-titres calqué sur la vidéo Facebook de référence :
+                # - Texte blanc GRAS avec contour noir épais (Outline=3)
+                # - Centré horizontalement, position 74% de la hauteur (MarginV=308)
+                # - FontSize=36, pas de fond/rectangle
                 vf_filter = (
                     title_filter + ","
-                    f"subtitles={local_srt}:force_style='FontSize=28,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=0,Alignment=2,MarginV=180'"
+                    f"subtitles={local_srt}:force_style='FontSize=36,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=3,Bold=1,Shadow=0,Alignment=2,MarginV=400'"
                 )
 
                 result = subprocess.run([

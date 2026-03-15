@@ -475,28 +475,28 @@ def process_videos():
                              .replace(":", "\\:")
                              .replace("%", "%%"))
 
-                # Police pour le titre - fontsize=70 comme dans le Colab original
+                # Police pour le titre
+                # fontsize=50 : assez grand pour être lisible, tient dans la largeur sans déborder
                 if os.path.exists(FONT_PATH):
                     font_path_esc = FONT_PATH.replace(':', '\\:')
-                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=70"
+                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=50"
                 else:
-                    font_base = "fontcolor=black:fontsize=70"
+                    font_base = "fontcolor=black:fontsize=50"
 
                 # Construire le filtre titre
-                # Style exact du Colab : fond blanc, texte noir, Montserrat-Bold, fontsize=70, y=780
-                # Le fond blanc couvre la zone du titre (centré horizontalement)
-                # On utilise drawbox + drawtext comme dans la vidéo de référence
+                # Style exact du Colab : fond blanc adapté à la largeur du texte (pas pleine largeur)
+                # drawtext box=1 + boxborderw simule TextClip method="label" bg_color="white"
                 if line2:
-                    # 2 lignes : estimer la hauteur du fond (fontsize=70 * 2 lignes + padding)
                     title_filter = (
-                        f"drawbox=x=0:y=760:w=w:h=160:color=white@1.0:t=fill:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=775:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=845:enable='lt(t,4)'"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:"
+                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=848:"
+                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
                     )
                 else:
                     title_filter = (
-                        f"drawbox=x=0:y=760:w=w:h=90:color=white@1.0:t=fill:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:enable='lt(t,4)'"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=800:"
+                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
                     )
 
                 # Construire les filtres drawtext pour les sous-titres

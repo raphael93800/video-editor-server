@@ -381,32 +381,57 @@ def process_videos():
                 print(f"📝 Sous-titres générés")
 
                 # 11. Brûler les sous-titres + titre overlay avec FFmpeg
-                # Titre sur 1 ou 2 lignes max, on remplace les sauts de ligne par un espace
-                title_clean = video_title.replace("\n", " ").strip()
-                title_line = title_clean.replace("'", "\\'").replace(":", "\\:").replace("%", "%%")
+                # Mesures exactes issues de la vidéo de référence (720x1280) :
+                # Fond blanc titre : x=72, y=705, w=573, h=114
+                # Texte titre : fontsize=36, noir, centré horizontalement
+                # Sous-titres : FontSize=28, blanc avec contour noir, MarginV=180 (y~1100)
 
-                # Dimensions vidéo : 720x1280
-                # Fond blanc : x=30, y=640, w=660, h=140 (centré verticalement dans le tiers bas)
-                # Texte noir gras centré dans le fond blanc
-                # Sous-titres : petits (fontsize=16), en bas, discrets avec contour noir
+                # Couper le titre en 2 lignes si trop long (max ~22 chars par ligne)
+                title_clean = video_title.replace("\n", " ").strip()
+                words = title_clean.split()
+                line1, line2 = "", ""
+                mid = len(words) // 2
+                # Essayer de couper au milieu des mots
+                for cut in range(mid, len(words)):
+                    candidate1 = " ".join(words[:cut])
+                    candidate2 = " ".join(words[cut:])
+                    if len(candidate1) <= 22:
+                        line1, line2 = candidate1, candidate2
+                        break
+                if not line1:
+                    line1 = title_clean
+                    line2 = ""
+
+                def esc(s):
+                    return s.replace("'", "\\'").replace(":", "\\:").replace("%", "%%")
 
                 # Vérifier si la police Montserrat existe
                 font_path_esc = FONT_PATH.replace(':', '\\:')
                 if os.path.exists(FONT_PATH):
-                    title_font = f"fontfile={font_path_esc}:fontcolor=black:fontsize=36"
-                    sub_font = f"fontfile={font_path_esc}"
+                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=36"
                 else:
-                    title_font = "fontcolor=black:fontsize=36"
-                    sub_font = ""
+                    font_base = "fontcolor=black:fontsize=36"
 
-                # Filtre complet :
-                # 1. Fond blanc pour le titre (pendant 4s)
-                # 2. Texte du titre noir centré sur le fond blanc (pendant 4s)
-                # 3. Sous-titres petits en bas (tout le long)
+                # Construire le filtre
+                if line2:
+                    # 2 lignes : ligne1 y=718, ligne2 y=762
+                    title_filter = (
+                        f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=718:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=762:enable='lt(t,4)'"
+                    )
+                else:
+                    # 1 ligne : centrée verticalement dans le fond (y=750)
+                    title_filter = (
+                        f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=750:enable='lt(t,4)'"
+                    )
+
+                # Filtre complet : titre + sous-titres
+                # Sous-titres : FontSize=28, MarginV=180 = y centre ~1100 (comme la référence)
                 vf_filter = (
-                    f"drawbox=x=30:y=640:w=660:h=150:color=white@1.0:t=fill:enable='lt(t,4)',"
-                    f"drawtext=text='{title_line}':{title_font}:x=(w-tw)/2:y=695:enable='lt(t,4)',"
-                    f"subtitles={local_srt}:force_style='FontSize=16,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=0,Alignment=2,MarginV=40'"
+                    title_filter + ","
+                    f"subtitles={local_srt}:force_style='FontSize=28,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Bold=0,Alignment=2,MarginV=180'"
                 )
 
                 result = subprocess.run([

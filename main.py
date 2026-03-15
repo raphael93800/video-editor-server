@@ -384,8 +384,9 @@ def process_videos():
                 title_line = video_title.replace("'", "\\'").replace(":", "\\:").replace("\n", " ")
 
                 # Vérifier si la police Montserrat existe
+                font_path_esc = FONT_PATH.replace(':', '\\:')
                 if os.path.exists(FONT_PATH):
-                    font_spec = f"fontfile={FONT_PATH.replace(':', '\\:')}:fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
+                    font_spec = f"fontfile={font_path_esc}:fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
                 else:
                     font_spec = "fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
 

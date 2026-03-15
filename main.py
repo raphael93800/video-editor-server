@@ -224,6 +224,10 @@ def get_speech_bounds(model, video_path, video_duration):
 # FFMPEG : générer les sous-titres au format SRT
 # ============================================================
 def generate_srt(model, audio_path):
+    """Transcrit l'audio complet (hook+Part2) et génère un SRT.
+    Chunks de 5 mots comme dans le script Colab original.
+    Les timestamps sont relatifs au début de la vidéo concaténée.
+    """
     result = model.transcribe(audio_path, word_timestamps=True)
     words_all = []
     for segment in result.get("segments", []):
@@ -234,7 +238,7 @@ def generate_srt(model, audio_path):
     chunk = []
     for i, w in enumerate(words_all):
         chunk.append(w)
-        if len(chunk) >= 4 or i == len(words_all) - 1:
+        if len(chunk) >= 5 or i == len(words_all) - 1:
             start = chunk[0]["start"]
             end = chunk[-1]["end"]
             text = " ".join([x["word"].strip() for x in chunk]).lstrip(",. ")
@@ -256,20 +260,22 @@ def generate_srt(model, audio_path):
 # ============================================================
 # Construire les filtres drawtext pour les sous-titres
 # ============================================================
-def build_subtitle_drawtext_filters(srt_path, hook_duration, font_path):
+def build_subtitle_drawtext_filters(srt_path, font_path):
     """Parse le SRT et génère des filtres drawtext FFmpeg.
-    Les timestamps du SRT sont déjà décalés de +hook_duration.
-    Police : LiberationSans-Bold (toujours disponible).
-    Position : 90px depuis le bas, centré horizontalement.
-    Taille : 18px réels sur 720x1280.
+    Reproduit EXACTEMENT le style du script Colab original :
+    - fontsize=34, color=white, bg_color=black (box noir)
+    - position y=965 (centré horizontalement)
+    - Les timestamps couvrent toute la vidéo (hook + Part2)
     """
     import re as _re
 
-    # Police disponible sur Render
+    # Police : Montserrat-Bold si disponible, sinon Arial/Liberation
     if os.path.exists(font_path):
         font_arg = f"fontfile={font_path.replace(':', chr(92) + ':')}"
-    else:
+    elif os.path.exists('/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf'):
         font_arg = "fontfile=/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    else:
+        font_arg = ""
 
     with open(srt_path, encoding="utf-8") as f:
         content = f.read()
@@ -300,12 +306,22 @@ def build_subtitle_drawtext_filters(srt_path, hook_duration, font_path):
             .replace(']', '\\]')
             .replace('%', '%%')
         )
-        f_str = (
-            f"drawtext={font_arg}:text='{text_esc}':"
-            f"fontcolor=white:fontsize=18:x=(w-tw)/2:y=h-90:"
-            f"bordercolor=black:borderw=2:"
-            f"enable='between(t,{start},{end})'"
-        )
+        # Style exact du Colab : fontsize=34, blanc sur fond noir, y=965
+        # box=1 + boxcolor=black simule bg_color="black" de TextClip
+        if font_arg:
+            f_str = (
+                f"drawtext={font_arg}:text='{text_esc}':"
+                f"fontcolor=white:fontsize=34:x=(w-tw)/2:y=965:"
+                f"box=1:boxcolor=black@1.0:boxborderw=8:"
+                f"enable='between(t,{start},{end})'"
+            )
+        else:
+            f_str = (
+                f"drawtext=text='{text_esc}':"
+                f"fontcolor=white:fontsize=34:x=(w-tw)/2:y=965:"
+                f"box=1:boxcolor=black@1.0:boxborderw=8:"
+                f"enable='between(t,{start},{end})'"
+            )
         filters.append(f_str)
     return filters
 
@@ -459,31 +475,34 @@ def process_videos():
                              .replace(":", "\\:")
                              .replace("%", "%%"))
 
-                # Police pour le titre
+                # Police pour le titre - fontsize=70 comme dans le Colab original
                 if os.path.exists(FONT_PATH):
                     font_path_esc = FONT_PATH.replace(':', '\\:')
-                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=36"
+                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=70"
                 else:
-                    font_base = "fontcolor=black:fontsize=36"
+                    font_base = "fontcolor=black:fontsize=70"
 
                 # Construire le filtre titre
+                # Style exact du Colab : fond blanc, texte noir, Montserrat-Bold, fontsize=70, y=780
+                # Le fond blanc couvre la zone du titre (centré horizontalement)
+                # On utilise drawbox + drawtext comme dans la vidéo de référence
                 if line2:
+                    # 2 lignes : estimer la hauteur du fond (fontsize=70 * 2 lignes + padding)
                     title_filter = (
-                        f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=718:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=762:enable='lt(t,4)'"
+                        f"drawbox=x=0:y=760:w=w:h=160:color=white@1.0:t=fill:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=775:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=845:enable='lt(t,4)'"
                     )
                 else:
                     title_filter = (
-                        f"drawbox=x=72:y=705:w=573:h=114:color=white@1.0:t=fill:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=750:enable='lt(t,4)'"
+                        f"drawbox=x=0:y=760:w=w:h=90:color=white@1.0:t=fill:enable='lt(t,4)',"
+                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:enable='lt(t,4)'"
                     )
 
                 # Construire les filtres drawtext pour les sous-titres
-                # Le SRT contient des timestamps relatifs à la vidéo concaténée
-                # (Whisper a transcrit l’audio complet, donc les timestamps incluent déjà le hook)
-                hook_cut_duration = get_video_duration(local_hook_cut)
-                sub_filters = build_subtitle_drawtext_filters(local_srt, hook_cut_duration, FONT_PATH)
+                # Whisper a transcrit l’audio complet (hook + Part2)
+                # Les timestamps couvrent donc toute la vidéo
+                sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
 
                 # Filtre complet : titre + sous-titres
                 all_filters = [title_filter] + sub_filters

@@ -24,7 +24,7 @@ VIDEOS_SHEET_URL    = os.environ.get("VIDEOS_SHEET_URL",    "https://docs.google
 HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
 RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
 PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
-DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no\none told you about")
+DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no one told you about")
 VIDEOS_PER_CAMPAIGN = int(os.environ.get("VIDEOS_PER_CAMPAIGN", "20"))
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
@@ -181,6 +181,31 @@ def get_video_duration(path):
     return float(result.stdout.strip())
 
 # ============================================================
+# FFMPEG : vérifier si une vidéo a une piste vidéo
+# ============================================================
+def has_video_stream(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_type",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True
+    )
+    return "video" in result.stdout.strip()
+
+# ============================================================
+# FFMPEG : ré-encoder proprement une vidéo (fix keyframes)
+# ============================================================
+def reencode_video(input_path, output_path):
+    """Ré-encode la vidéo pour s'assurer qu'elle est bien formée."""
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-ar", "44100",
+        "-movflags", "+faststart",
+        output_path
+    ], check=True, capture_output=True)
+
+# ============================================================
 # FFMPEG : détecter start/end de la parole via Whisper
 # ============================================================
 def get_speech_bounds(model, video_path, video_duration):
@@ -236,6 +261,7 @@ def process_videos():
     date_du_jour = now.strftime("%d.%m")
     day_month_slash = now.strftime("%d/%m")
     local_part2 = "/tmp/partie2.mp4"
+    local_part2_clean = "/tmp/partie2_clean.mp4"
 
     try:
         drive_service, gc = get_google_services()
@@ -247,10 +273,15 @@ def process_videos():
         edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
         original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
 
-        # Télécharger Part2
+        # Télécharger et ré-encoder Part2 (une seule fois)
         if os.path.exists(local_part2):
             os.remove(local_part2)
+        if os.path.exists(local_part2_clean):
+            os.remove(local_part2_clean)
         drive_download_file(drive_service, PART2_FILE_ID, local_part2)
+        # Ré-encoder Part2 pour garantir la compatibilité
+        reencode_video(local_part2, local_part2_clean)
+        print("✅ Part2 téléchargée et ré-encodée")
 
         # Lister les vidéos dans HOOKS
         hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
@@ -268,13 +299,14 @@ def process_videos():
             hook_id   = f["id"]
             hook_name = f["name"]
             nom_final = f"{date_du_jour}_V{index}.mp4"
-            local_hook     = f"/tmp/hook_{index}.mp4"
-            local_hook_cut = f"/tmp/hook_cut_{index}.mp4"
-            local_concat   = f"/tmp/concat_{index}.mp4"
-            local_audio    = f"/tmp/audio_{index}.wav"
-            local_srt      = f"/tmp/subs_{index}.srt"
-            local_out      = f"/tmp/out_{index}.mp4"
-            concat_list    = f"/tmp/list_{index}.txt"
+            local_hook      = f"/tmp/hook_{index}.mp4"
+            local_hook_clean = f"/tmp/hook_clean_{index}.mp4"
+            local_hook_cut  = f"/tmp/hook_cut_{index}.mp4"
+            local_concat    = f"/tmp/concat_{index}.mp4"
+            local_audio     = f"/tmp/audio_{index}.wav"
+            local_srt       = f"/tmp/subs_{index}.srt"
+            local_out       = f"/tmp/out_{index}.mp4"
+            concat_list     = f"/tmp/list_{index}.txt"
 
             # Titre dynamique
             if index - 1 < len(titles_from_sheet):
@@ -285,74 +317,111 @@ def process_videos():
             try:
                 # 1. Télécharger le hook
                 drive_download_file(drive_service, hook_id, local_hook)
-                hook_duration = get_video_duration(local_hook)
+                print(f"📥 Hook téléchargé: {hook_name}")
 
-                # 2. Détecter les bornes de parole
-                start_t, end_t, _ = get_speech_bounds(model, local_hook, hook_duration)
+                # 2. Ré-encoder le hook pour garantir la piste vidéo et les keyframes
+                reencode_video(local_hook, local_hook_clean)
+                print(f"🔄 Hook ré-encodé proprement")
 
-                # 3. Couper le hook
+                # 3. Vérifier que la piste vidéo est présente
+                if not has_video_stream(local_hook_clean):
+                    raise Exception(f"Pas de piste vidéo dans {hook_name} après ré-encodage")
+
+                hook_duration = get_video_duration(local_hook_clean)
+                print(f"⏱ Durée hook: {hook_duration:.2f}s")
+
+                # 4. Détecter les bornes de parole
+                start_t, end_t, _ = get_speech_bounds(model, local_hook_clean, hook_duration)
+                print(f"🎤 Parole détectée: {start_t:.2f}s → {end_t:.2f}s")
+
+                # 5. Couper le hook (avec ré-encodage pour éviter les problèmes de keyframes)
                 subprocess.run([
-                    "ffmpeg", "-y", "-i", local_hook,
+                    "ffmpeg", "-y", "-i", local_hook_clean,
                     "-ss", str(start_t), "-to", str(end_t),
-                    "-c", "copy", local_hook_cut
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-ar", "44100",
+                    local_hook_cut
                 ], check=True, capture_output=True)
+                print(f"✂️ Hook coupé")
 
-                # 4. Concaténer hook + part2
+                # 6. Vérifier que le hook coupé a bien une piste vidéo
+                if not has_video_stream(local_hook_cut):
+                    raise Exception("Hook coupé sans piste vidéo")
+
+                # 7. Concaténer hook + part2 (les deux sont déjà ré-encodés avec mêmes paramètres)
                 with open(concat_list, "w") as cl:
                     cl.write(f"file '{local_hook_cut}'\n")
-                    cl.write(f"file '{local_part2}'\n")
+                    cl.write(f"file '{local_part2_clean}'\n")
 
                 subprocess.run([
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                     "-i", concat_list,
-                    "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart",
+                    "-c:v", "libx264", "-c:a", "aac",
+                    "-preset", "fast", "-crf", "23",
+                    "-movflags", "+faststart",
                     local_concat
                 ], check=True, capture_output=True)
+                print(f"🔗 Concaténation OK")
 
-                # 5. Extraire l'audio pour Whisper
+                # 8. Vérifier que la concaténation a une piste vidéo
+                if not has_video_stream(local_concat):
+                    raise Exception("Vidéo concaténée sans piste vidéo")
+
+                # 9. Extraire l'audio pour Whisper
                 subprocess.run([
                     "ffmpeg", "-y", "-i", local_concat,
                     "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                     local_audio
                 ], check=True, capture_output=True)
 
-                # 6. Générer les sous-titres SRT
+                # 10. Générer les sous-titres SRT
                 srt_content = generate_srt(model, local_audio)
                 with open(local_srt, "w", encoding="utf-8") as sf:
                     sf.write(srt_content)
+                print(f"📝 Sous-titres générés")
 
-                # 7. Brûler les sous-titres + titre overlay avec FFmpeg
-                # Titre en overlay pendant 4 secondes (boîte blanche avec texte noir)
-                title_escaped = video_title.replace("'", "\\'").replace(":", "\\:").replace("\n", " ")
-                font_path_escaped = FONT_PATH.replace(":", "\\:")
+                # 11. Brûler les sous-titres + titre overlay avec FFmpeg
+                title_line = video_title.replace("'", "\\'").replace(":", "\\:").replace("\n", " ")
 
                 # Vérifier si la police Montserrat existe
                 if os.path.exists(FONT_PATH):
-                    font_arg = f"fontfile={font_path_escaped}:fontcolor=black:fontsize=55"
+                    font_spec = f"fontfile={FONT_PATH.replace(':', '\\:')}:fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
                 else:
-                    font_arg = "fontcolor=black:fontsize=55"
+                    font_spec = "fontcolor=white:fontsize=30:borderw=2:bordercolor=black"
 
-                # Filtre FFmpeg : sous-titres + titre overlay
+                # Filtre : sous-titres centrés en bas + titre en haut pendant 4s
                 vf_filter = (
-                    f"subtitles={local_srt}:force_style='FontSize=28,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=80',"
-                    f"drawbox=x=(W-tw)/2-20:y=780-10:w=tw+40:h=th+20:color=white@1.0:t=fill:enable='lt(t,4)',"
-                    f"drawtext=text='{title_escaped}':{font_arg}:x=(w-tw)/2:y=790:enable='lt(t,4)'"
+                    f"subtitles={local_srt}:force_style='FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Alignment=2,MarginV=60',"
+                    f"drawtext=text='{title_line}':{font_spec}:x=(w-tw)/2:y=80:enable='lt(t,4)'"
                 )
 
-                subprocess.run([
+                result = subprocess.run([
                     "ffmpeg", "-y", "-i", local_concat,
                     "-vf", vf_filter,
                     "-c:v", "libx264", "-c:a", "aac",
                     "-preset", "fast", "-crf", "23",
                     "-movflags", "+faststart",
                     local_out
-                ], check=True, capture_output=True)
+                ], capture_output=True, text=True)
 
-                # 8. Upload vers Drive
+                if result.returncode != 0:
+                    print(f"⚠️ Erreur overlay: {result.stderr[-500:]}")
+                    # Fallback: upload sans overlay si erreur
+                    import shutil
+                    shutil.copy(local_concat, local_out)
+
+                # 12. Vérification finale
+                if not has_video_stream(local_out):
+                    raise Exception("Fichier final sans piste vidéo")
+
+                final_duration = get_video_duration(local_out)
+                print(f"✅ Vidéo finale: {final_duration:.2f}s avec piste vidéo")
+
+                # 13. Upload vers Drive
                 out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
                 drive_move_file(drive_service, hook_id, original_folder_id)
 
-                # 9. Log dans le Master Sheet
+                # 14. Log dans le Master Sheet
                 existing_before = count_videos_in_drive_folder(drive_service, edited_folder_id) - 1
                 version = (existing_before // VIDEOS_PER_CAMPAIGN) + 1
                 campaign_name = f"C{version}_{day_month_slash}"
@@ -364,14 +433,16 @@ def process_videos():
                 )
 
                 success_count += 1
-                print(f"✅ {nom_final} monté avec succès")
+                print(f"✅ {nom_final} monté et uploadé avec succès")
 
             except Exception as e:
                 error_count += 1
                 print(f"❌ Erreur sur {hook_name}: {e}")
+                send_telegram(f"⚠️ Erreur sur {hook_name}: {str(e)[:150]}")
 
             finally:
-                for path in [local_hook, local_hook_cut, local_concat, local_audio, local_srt, local_out, concat_list]:
+                for path in [local_hook, local_hook_clean, local_hook_cut, local_concat,
+                             local_audio, local_srt, local_out, concat_list]:
                     try:
                         if os.path.exists(path):
                             os.remove(path)

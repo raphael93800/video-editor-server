@@ -375,12 +375,13 @@ def process_videos():
         master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
         video_data = load_video_data_from_sheet(gc)
 
-        # Numérotation continue : compter les lignes déjà dans le master sheet
+        # Numérotation continue sur la journée : compter les vidéos du jour dans le master sheet
         existing_rows = master_ws.get_all_values()
-        # Compter les lignes avec données (hors header)
-        existing_count = len([r for r in existing_rows[1:] if r and r[0].strip()]) if len(existing_rows) > 1 else 0
-        start_index = existing_count + 1  # V(existing_count+1), V(existing_count+2)...
-        print(f"📊 Master sheet: {existing_count} vidéos existantes → prochaine numérotation à partir de V{start_index}")
+        # Compter les lignes dont le Ad_Name commence par la date du jour (ex: "15.03_V")
+        today_prefix = f"{date_du_jour}_V"
+        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+        start_index = existing_today + 1  # V1 le matin, continue là où on s'est arrêté le soir
+        print(f"📊 Master sheet: {existing_today} vidéos aujourd'hui ({date_du_jour}) → prochaine numérotation à partir de V{start_index}")
 
         # Préparer les dossiers Drive
         today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)

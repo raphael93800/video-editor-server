@@ -215,7 +215,8 @@ def get_speech_bounds(model, video_path, video_duration):
         words.extend(segment.get("words", []))
     if words:
         start_t = max(0, words[0]["start"] - 0.1)
-        end_t = min(words[-1]["end"] + 0.8, video_duration - 0.05)
+        # Couper exactement au dernier mot + 0.1s max (coupure nette, 0 silence)
+        end_t = min(words[-1]["end"] + 0.1, video_duration - 0.05)
     else:
         start_t, end_t = 0, video_duration
     return start_t, end_t, result

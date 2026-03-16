@@ -639,6 +639,116 @@ def process_videos():
                     except:
                         pass
 
+        # Après chaque batch : revérifier HOOKS (boucle continue)
+        # Attend 30s et revérifie si de nouveaux hooks sont arrivés
+        empty_checks = 0
+        while empty_checks < 2:  # S'arrête seulement si HOOKS vide 2 fois de suite
+            import time
+            print("⏳ Attente 30s avant de revérifier HOOKS...")
+            time.sleep(30)
+            new_hooks = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
+            if not new_hooks:
+                empty_checks += 1
+                print(f"📭 HOOKS vide ({empty_checks}/2)")
+            else:
+                empty_checks = 0  # Reset si de nouveaux hooks trouvés
+                print(f"🎬 {len(new_hooks)} nouveau(x) hook(s) trouvé(s) — on continue!")
+                # Recalculer la numérotation
+                existing_rows = master_ws.get_all_values()
+                existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+                start_index = existing_today + 1
+                for loop_idx, f in enumerate(new_hooks, start=0):
+                    global_index = start_index + loop_idx
+                    hook_id   = f["id"]
+                    hook_name = f["name"]
+                    nom_final = f"{date_du_jour}_V{global_index}.mp4"
+                    local_hook      = f"/tmp/hook_{global_index}.mp4"
+                    local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
+                    local_hook_cut  = f"/tmp/hook_cut_{global_index}.mp4"
+                    local_concat    = f"/tmp/concat_{global_index}.mp4"
+                    local_audio     = f"/tmp/audio_{global_index}.wav"
+                    local_srt       = f"/tmp/subs_{global_index}.srt"
+                    local_out       = f"/tmp/out_{global_index}.mp4"
+                    concat_list     = f"/tmp/list_{global_index}.txt"
+                    if loop_idx < len(video_data):
+                        vd = video_data[loop_idx]
+                        video_title    = vd["title"] or DEFAULT_TITLE
+                        video_headline = vd["headline"]
+                        video_primary  = vd["primary_text"]
+                        video_prompt   = vd["video_prompt"]
+                    else:
+                        video_title    = DEFAULT_TITLE
+                        video_headline = ""
+                        video_primary  = ""
+                        video_prompt   = ""
+                    # Réutiliser le même bloc de traitement (appel récursif simplifié)
+                    try:
+                        drive_download_file(drive_service, hook_id, local_hook)
+                        reencode_video(local_hook, local_hook_clean)
+                        if not has_video_stream(local_hook_clean):
+                            raise Exception(f"Pas de piste vidéo dans {hook_name}")
+                        hook_duration = get_video_duration(local_hook_clean)
+                        local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
+                        subprocess.run(["ffmpeg","-y","-i",local_hook_clean,"-vn","-acodec","pcm_s16le","-ar","16000","-ac","1",local_hook_audio], check=True, capture_output=True)
+                        start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
+                        subprocess.run(["ffmpeg","-y","-i",local_hook_clean,"-ss",str(start_t),"-to",str(end_t),"-c:v","libx264","-preset","fast","-crf","23","-c:a","aac","-ar","44100",local_hook_cut], check=True, capture_output=True)
+                        if not has_video_stream(local_hook_cut):
+                            raise Exception("Hook coupé sans piste vidéo")
+                        with open(concat_list, "w") as cl:
+                            cl.write(f"file '{local_hook_cut}'\nfile '{local_part2_clean}'\n")
+                        subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",concat_list,"-c:v","libx264","-c:a","aac","-preset","fast","-crf","23","-movflags","+faststart",local_concat], check=True, capture_output=True)
+                        if not has_video_stream(local_concat):
+                            raise Exception("Vidéo concaténée sans piste vidéo")
+                        subprocess.run(["ffmpeg","-y","-i",local_concat,"-vn","-acodec","pcm_s16le","-ar","16000","-ac","1",local_audio], check=True, capture_output=True)
+                        srt_content = generate_srt(local_audio)
+                        with open(local_srt, "w", encoding="utf-8") as sf:
+                            sf.write(srt_content)
+                        title_clean = video_title.replace("\n", " ").strip()
+                        words_t = title_clean.split()
+                        line1, line2 = "", ""
+                        mid = len(words_t) // 2
+                        for cut in range(mid, len(words_t)):
+                            candidate1 = " ".join(words_t[:cut])
+                            candidate2 = " ".join(words_t[cut:])
+                            if len(candidate1) <= 22:
+                                line1, line2 = candidate1, candidate2
+                                break
+                        if not line1:
+                            line1 = title_clean
+                        def esc2(s):
+                            return s.replace("'", "\u2019").replace('"', '').replace(':', '\\:')
+                        font_base2 = f"fontfile={FONT_PATH.replace(':', chr(92)+':')}:fontsize=50:fontcolor=black:bold=1" if os.path.exists(FONT_PATH) else "fontsize=50:fontcolor=black:bold=1"
+                        if line2:
+                            title_filter = (f"drawtext=text='{esc2(line1)}':{font_base2}:x=(w-tw)/2:y=755:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'," + f"drawtext=text='{esc2(line2)}':{font_base2}:x=(w-tw)/2:y=820:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'")
+                        else:
+                            title_filter = f"drawtext=text='{esc2(line1)}':{font_base2}:x=(w-tw)/2:y=800:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
+                        sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
+                        all_filters = [title_filter] + sub_filters
+                        vf_filter = ",".join(all_filters)
+                        result2 = subprocess.run(["ffmpeg","-y","-i",local_concat,"-vf",vf_filter,"-c:v","libx264","-c:a","aac","-preset","fast","-crf","23","-movflags","+faststart",local_out], capture_output=True, text=True)
+                        if result2.returncode != 0:
+                            import shutil; shutil.copy(local_concat, local_out)
+                        if not has_video_stream(local_out):
+                            raise Exception("Fichier final sans piste vidéo")
+                        out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
+                        drive_move_file(drive_service, hook_id, original_folder_id)
+                        version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+                        campaign_name = f"C{date_du_jour}_{version:02d}"
+                        adset_name    = f"adset{version}_{date_du_jour}"
+                        drive_link, direct_link = make_drive_links(out_id)
+                        master_ws.append_row([nom_final.replace(".mp4",""), drive_link, direct_link, campaign_name, adset_name, video_primary, video_headline, video_prompt, "ready"], value_input_option="USER_ENTERED")
+                        success_count += 1
+                        print(f"✅ {nom_final} monté (boucle continue)")
+                    except Exception as e2:
+                        error_count += 1
+                        print(f"❌ Erreur {hook_name}: {e2}")
+                        send_telegram(f"⚠️ Erreur {hook_name}: {str(e2)[:150]}")
+                    finally:
+                        for path in [local_hook, local_hook_clean, local_hook_cut, local_concat, local_audio, local_srt, local_out, concat_list]:
+                            try:
+                                if os.path.exists(path): os.remove(path)
+                            except: pass
+
         # Rapport final Telegram
         msg = f"🚀 *Video Editor — Mission accomplie!*\n\n"
         msg += f"✅ {success_count} vidéo(s) montée(s) avec succès\n"

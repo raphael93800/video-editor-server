@@ -3,7 +3,7 @@ import io
 import datetime
 import subprocess
 import threading
-import tempfile
+import time
 import openai
 import gspread
 from fastapi import FastAPI, BackgroundTasks
@@ -20,7 +20,6 @@ app = FastAPI()
 # CONFIGURATION (via variables d'environnement sur Render)
 # ============================================================
 MASTER_SHEET_URL    = os.environ.get("MASTER_SHEET_URL",    "https://docs.google.com/spreadsheets/d/1tlB7auPNU_fXUiuIbI-5EbmizInw4rw35tB2SWEvPas/edit")
-VIDEOS_SHEET_URL    = os.environ.get("VIDEOS_SHEET_URL",    "https://docs.google.com/spreadsheets/d/13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g/edit")
 HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
 RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
 PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
@@ -55,7 +54,8 @@ def get_google_services():
 # ============================================================
 # FONCTIONS DRIVE
 # ============================================================
-def drive_list_videos(drive_service, folder_id):
+def drive_list_all_files(drive_service, folder_id):
+    """Liste tous les fichiers dans un dossier (vidéos ET .txt)."""
     q = f"'{folder_id}' in parents and trashed = false"
     out = []
     page_token = None
@@ -70,9 +70,57 @@ def drive_list_videos(drive_service, folder_id):
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    out = [f for f in out if f["name"].lower().strip().endswith((".mp4", ".mov"))]
-    out.sort(key=lambda x: x["name"].lower())
     return out
+
+def drive_list_videos(drive_service, folder_id):
+    """Liste uniquement les fichiers vidéo (.mp4, .mov) dans HOOKS."""
+    all_files = drive_list_all_files(drive_service, folder_id)
+    videos = [f for f in all_files if f["name"].lower().strip().endswith((".mp4", ".mov"))]
+    videos.sort(key=lambda x: x["name"].lower())
+    return videos
+
+def drive_find_txt_for_hook(drive_service, folder_id, hook_name):
+    """
+    Cherche le fichier .txt qui correspond au hook.
+    n8n crée veo_HHMMSS_xxx.mp4 ET veo_HHMMSS_xxx.txt dans le même dossier.
+    """
+    stem = os.path.splitext(hook_name)[0]  # "veo_HHMMSS_xxx"
+    txt_name = stem + ".txt"
+    all_files = drive_list_all_files(drive_service, folder_id)
+    for f in all_files:
+        if f["name"] == txt_name:
+            return f["id"]
+    return None
+
+def drive_read_txt_metadata(drive_service, file_id):
+    """
+    Télécharge et parse le fichier .txt JSON créé par n8n.
+    Format attendu :
+    {
+      "video_title": "...",
+      "primary_text": "...",
+      "headline": "...",
+      "video_prompt": "..."
+    }
+    """
+    try:
+        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        content = buf.getvalue().decode("utf-8")
+        data = json.loads(content)
+        return {
+            "title":        data.get("video_title", "").strip(),
+            "headline":     data.get("headline", "").strip(),
+            "primary_text": data.get("primary_text", "").strip(),
+            "video_prompt": data.get("video_prompt", "").strip(),
+        }
+    except Exception as e:
+        print(f"⚠️ Impossible de lire le .txt metadata: {e}")
+        return None
 
 def drive_download_file(drive_service, file_id, local_path):
     request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -108,6 +156,13 @@ def drive_move_file(drive_service, file_id, new_parent_id):
         supportsAllDrives=True
     ).execute()
 
+def drive_delete_file(drive_service, file_id):
+    """Supprime un fichier de Drive (pour nettoyer les .txt après traitement)."""
+    try:
+        drive_service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception as e:
+        print(f"⚠️ Impossible de supprimer le fichier Drive: {e}")
+
 def drive_upload_video(drive_service, local_path, parent_id, filename):
     media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True)
     meta = {"name": filename, "parents": [parent_id]}
@@ -120,15 +175,6 @@ def make_drive_links(file_id):
     share_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
     direct_download = f"https://drive.google.com/uc?export=download&id={file_id}"
     return share_link, direct_download
-
-def count_videos_in_drive_folder(drive_service, folder_id):
-    q = f"'{folder_id}' in parents and trashed = false"
-    resp = drive_service.files().list(
-        q=q, fields="files(id,name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
-    ).execute()
-    return len([f for f in resp.get("files", []) if f["name"].lower().endswith((".mp4", ".mov"))])
 
 # ============================================================
 # TELEGRAM
@@ -143,61 +189,6 @@ def send_telegram(msg):
         )
     except:
         pass
-
-# ============================================================
-# CHARGER LES DONNÉES DEPUIS LE SHEET VIDEO IA N8N
-# ============================================================
-def load_video_data_from_sheet(gc):
-    """
-    Lit le sheet Video IA n8N et retourne une liste de dicts avec :
-    - title : titre de la vidéo (pour l'overlay)
-    - headline : headline Meta
-    - primary_text : texte principal Meta
-    - video_prompt : prompt utilisé pour générer le hook
-    """
-    try:
-        videos_ws = gc.open_by_url(VIDEOS_SHEET_URL).sheet1
-        all_rows = videos_ws.get_all_values()
-        if not all_rows:
-            return []
-        headers = [h.lower().strip() for h in all_rows[0]]
-
-        def find_col(keywords):
-            for i, h in enumerate(headers):
-                if all(k in h for k in keywords):
-                    return i
-            for i, h in enumerate(headers):
-                if any(k in h for k in keywords):
-                    return i
-            return None
-
-        title_col   = find_col(["title"])
-        headline_col = find_col(["headline"])
-        primary_col  = find_col(["primary"])
-        prompt_col   = find_col(["prompt"])
-
-        data = []
-        for row in all_rows[1:]:
-            def get(col):
-                if col is not None and len(row) > col:
-                    return row[col].strip()
-                return ""
-            if get(title_col):
-                data.append({
-                    "title":        get(title_col),
-                    "headline":     get(headline_col),
-                    "primary_text": get(primary_col),
-                    "video_prompt": get(prompt_col),
-                })
-        return data
-    except Exception as e:
-        print(f"Erreur chargement données sheet: {e}")
-        return []
-
-def load_titles_from_sheet(gc):
-    """Compatibilité — retourne juste les titres."""
-    data = load_video_data_from_sheet(gc)
-    return [d["title"] for d in data]
 
 # ============================================================
 # FFMPEG : obtenir la durée d'une vidéo
@@ -226,15 +217,11 @@ def has_video_stream(path):
 # FFMPEG : ré-encoder proprement une vidéo (fix keyframes)
 # ============================================================
 def reencode_video(input_path, output_path):
-    """Ré-encode la vidéo en forçant 24fps + 44100Hz stéréo.
-    Critique pour la transition : hook et Part2 DOIVENT avoir exactement
-    les mêmes fps et sample rate pour que FFmpeg concat soit smooth.
-    """
     subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-r", "24",           # Forcer 24fps (identique pour hook ET Part2)
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",  # Stéréo 44100Hz
+        "-r", "24",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
         "-movflags", "+faststart",
         output_path
     ], check=True, capture_output=True)
@@ -243,7 +230,6 @@ def reencode_video(input_path, output_path):
 # FFMPEG : détecter start/end de la parole via Whisper
 # ============================================================
 def get_speech_bounds(audio_path, video_duration):
-    """Détecte les bornes de parole via l'API OpenAI Whisper."""
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     with open(audio_path, "rb") as f:
         result = client.audio.transcriptions.create(
@@ -264,10 +250,6 @@ def get_speech_bounds(audio_path, video_duration):
 # FFMPEG : générer les sous-titres au format SRT
 # ============================================================
 def generate_srt(audio_path):
-    """Transcrit l'audio complet (hook+Part2) et génère un SRT via API OpenAI Whisper.
-    Chunks de 5 mots comme dans le script Colab original.
-    Les timestamps sont relatifs au début de la vidéo concaténée.
-    """
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     with open(audio_path, "rb") as f:
         result = client.audio.transcriptions.create(
@@ -276,7 +258,10 @@ def generate_srt(audio_path):
             response_format="verbose_json",
             timestamp_granularities=["word"]
         )
-    words_all = result.words or []
+    words_all = []
+    if result.words:
+        for w in result.words:
+            words_all.append({"word": w.word, "start": w.start, "end": w.end})
 
     srt_lines = []
     idx = 1
@@ -301,20 +286,12 @@ def generate_srt(audio_path):
 
     return "\n".join(srt_lines)
 
-
 # ============================================================
 # Construire les filtres drawtext pour les sous-titres
 # ============================================================
 def build_subtitle_drawtext_filters(srt_path, font_path):
-    """Parse le SRT et génère des filtres drawtext FFmpeg.
-    Reproduit EXACTEMENT le style du script Colab original :
-    - fontsize=34, color=white, bg_color=black (box noir)
-    - position y=965 (centré horizontalement)
-    - Les timestamps couvrent toute la vidéo (hook + Part2)
-    """
     import re as _re
 
-    # Police : Montserrat-Bold si disponible, sinon Arial/Liberation
     if os.path.exists(font_path):
         font_arg = f"fontfile={font_path.replace(':', chr(92) + ':')}"
     elif os.path.exists('/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf'):
@@ -341,18 +318,15 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
         start = ts2s(m.group(1))
         end = ts2s(m.group(2))
         text = ' '.join(lines[2:]).strip()
-        # Échapper les caractères spéciaux pour FFmpeg drawtext
         text_esc = (text
             .replace('\\', '\\\\')
-            .replace("'", "\u2019")  # apostrophe typographique
+            .replace("'", "\u2019")
             .replace(':', '\\:')
             .replace(',', '\\,')
             .replace('[', '\\[')
             .replace(']', '\\]')
             .replace('%', '%%')
         )
-        # Style exact du Colab : fontsize=34, blanc sur fond noir, y=965
-        # box=1 + boxcolor=black simule bg_color="black" de TextClip
         if font_arg:
             f_str = (
                 f"drawtext={font_arg}:text='{text_esc}':"
@@ -371,385 +345,306 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
     return filters
 
 # ============================================================
-# MONTAGE PRINCIPAL VIA FFMPEG PUR
+# MONTAGE D'UN SEUL HOOK (fonction réutilisable)
+# ============================================================
+def process_single_hook(drive_service, master_ws, hook_file, global_index,
+                        date_du_jour, edited_folder_id, original_folder_id,
+                        local_part2_clean):
+    """
+    Monte une seule vidéo hook + Part2.
+    Lit les métadonnées depuis le fichier .txt créé par n8n dans HOOKS.
+    Retourne True si succès, False si erreur.
+    """
+    hook_id   = hook_file["id"]
+    hook_name = hook_file["name"]
+    nom_final = f"{date_du_jour}_V{global_index}.mp4"
+
+    local_hook       = f"/tmp/hook_{global_index}.mp4"
+    local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
+    local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
+    local_hook_cut   = f"/tmp/hook_cut_{global_index}.mp4"
+    local_concat     = f"/tmp/concat_{global_index}.mp4"
+    local_audio      = f"/tmp/audio_{global_index}.wav"
+    local_srt        = f"/tmp/subs_{global_index}.srt"
+    local_out        = f"/tmp/out_{global_index}.mp4"
+    concat_list      = f"/tmp/list_{global_index}.txt"
+
+    try:
+        # ── 1. Lire les métadonnées depuis le fichier .txt ──────────────────
+        # n8n crée veo_HHMMSS_xxx.txt avec le même nom que le hook .mp4
+        txt_file_id = drive_find_txt_for_hook(drive_service, HOOKS_FOLDER_ID, hook_name)
+        if txt_file_id:
+            meta = drive_read_txt_metadata(drive_service, txt_file_id)
+            if meta:
+                video_title    = meta["title"] or DEFAULT_TITLE
+                video_headline = meta["headline"]
+                video_primary  = meta["primary_text"]
+                video_prompt   = meta["video_prompt"]
+                print(f"📄 Métadonnées lues depuis .txt: titre='{video_title}'")
+            else:
+                video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
+        else:
+            print(f"⚠️ Pas de fichier .txt trouvé pour {hook_name} — utilisation des valeurs par défaut")
+            video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
+
+        # ── 2. Télécharger et ré-encoder le hook ────────────────────────────
+        drive_download_file(drive_service, hook_id, local_hook)
+        print(f"📥 Hook téléchargé: {hook_name}")
+        reencode_video(local_hook, local_hook_clean)
+        print(f"🔄 Hook ré-encodé")
+
+        if not has_video_stream(local_hook_clean):
+            raise Exception(f"Pas de piste vidéo dans {hook_name} après ré-encodage")
+
+        hook_duration = get_video_duration(local_hook_clean)
+        print(f"⏱ Durée hook: {hook_duration:.2f}s")
+
+        # ── 3. Détecter les bornes de parole ────────────────────────────────
+        subprocess.run([
+            "ffmpeg", "-y", "-i", local_hook_clean,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            local_hook_audio
+        ], check=True, capture_output=True)
+        start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
+        print(f"🎤 Parole: {start_t:.2f}s → {end_t:.2f}s")
+
+        # ── 4. Couper le hook ───────────────────────────────────────────────
+        subprocess.run([
+            "ffmpeg", "-y", "-i", local_hook_clean,
+            "-ss", str(start_t), "-to", str(end_t),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-ar", "44100",
+            local_hook_cut
+        ], check=True, capture_output=True)
+        print(f"✂️ Hook coupé")
+
+        if not has_video_stream(local_hook_cut):
+            raise Exception("Hook coupé sans piste vidéo")
+
+        # ── 5. Concaténer hook + Part2 ──────────────────────────────────────
+        with open(concat_list, "w") as cl:
+            cl.write(f"file '{local_hook_cut}'\n")
+            cl.write(f"file '{local_part2_clean}'\n")
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c:v", "libx264", "-c:a", "aac",
+            "-preset", "fast", "-crf", "23",
+            "-movflags", "+faststart",
+            local_concat
+        ], check=True, capture_output=True)
+        print(f"🔗 Concaténation OK")
+
+        if not has_video_stream(local_concat):
+            raise Exception("Vidéo concaténée sans piste vidéo")
+
+        # ── 6. Extraire l'audio pour Whisper ────────────────────────────────
+        subprocess.run([
+            "ffmpeg", "-y", "-i", local_concat,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            local_audio
+        ], check=True, capture_output=True)
+
+        # ── 7. Générer les sous-titres SRT ──────────────────────────────────
+        srt_content = generate_srt(local_audio)
+        with open(local_srt, "w", encoding="utf-8") as sf:
+            sf.write(srt_content)
+        print(f"📝 Sous-titres générés")
+
+        # ── 8. Construire le filtre titre ───────────────────────────────────
+        title_clean = video_title.replace("\n", " ").strip()
+        words_t = title_clean.split()
+        line1, line2 = "", ""
+        mid = len(words_t) // 2
+        for cut in range(mid, len(words_t)):
+            candidate1 = " ".join(words_t[:cut])
+            candidate2 = " ".join(words_t[cut:])
+            if len(candidate1) <= 22:
+                line1, line2 = candidate1, candidate2
+                break
+        if not line1:
+            line1 = title_clean
+            line2 = ""
+
+        def esc(s):
+            return (s.replace("\\", "\\\\")
+                     .replace("'", "\u2019")
+                     .replace(":", "\\:")
+                     .replace("%", "%%"))
+
+        if os.path.exists(FONT_PATH):
+            font_path_esc = FONT_PATH.replace(':', '\\:')
+            font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=50"
+        else:
+            font_base = "fontcolor=black:fontsize=50"
+
+        if line2:
+            title_filter = (
+                f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:"
+                f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)',"
+                f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=848:"
+                f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
+            )
+        else:
+            title_filter = (
+                f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=800:"
+                f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
+            )
+
+        # ── 9. Brûler titre + sous-titres ───────────────────────────────────
+        sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
+        all_filters = [title_filter] + sub_filters
+        vf_filter = ",".join(all_filters)
+
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", local_concat,
+            "-vf", vf_filter,
+            "-c:v", "libx264", "-c:a", "aac",
+            "-preset", "fast", "-crf", "23",
+            "-movflags", "+faststart",
+            local_out
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"⚠️ Erreur overlay: {result.stderr[-500:]}")
+            import shutil
+            shutil.copy(local_concat, local_out)
+
+        if not has_video_stream(local_out):
+            raise Exception("Fichier final sans piste vidéo")
+
+        final_duration = get_video_duration(local_out)
+        print(f"✅ Vidéo finale: {final_duration:.2f}s")
+
+        # ── 10. Upload vers Drive ────────────────────────────────────────────
+        out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
+        drive_move_file(drive_service, hook_id, original_folder_id)
+
+        # Supprimer le fichier .txt de HOOKS après traitement
+        if txt_file_id:
+            drive_delete_file(drive_service, txt_file_id)
+
+        # ── 11. Log dans le Master Sheet ────────────────────────────────────
+        version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+        campaign_name = f"C{date_du_jour}_{version:02d}"
+        adset_name    = f"adset{version}_{date_du_jour}"
+        drive_link, direct_link = make_drive_links(out_id)
+        master_ws.append_row(
+            [
+                nom_final.replace(".mp4", ""),  # Ad_Name
+                drive_link,                      # Drive_Share_Link
+                direct_link,                     # Direct_Download_Link
+                campaign_name,                   # Campaign_Name
+                adset_name,                      # AdSet_Name
+                video_primary,                   # Primary_Text
+                video_headline,                  # Headline
+                video_prompt,                    # Video_Prompt
+                "ready",                         # status
+            ],
+            value_input_option="USER_ENTERED"
+        )
+        print(f"✅ {nom_final} monté et uploadé avec succès")
+        return True
+
+    except Exception as e:
+        print(f"❌ Erreur sur {hook_name}: {e}")
+        send_telegram(f"⚠️ Erreur sur {hook_name}: {str(e)[:150]}")
+        return False
+
+    finally:
+        for path in [local_hook, local_hook_clean, local_hook_audio, local_hook_cut,
+                     local_concat, local_audio, local_srt, local_out, concat_list]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except:
+                pass
+
+# ============================================================
+# MONTAGE PRINCIPAL — BOUCLE CONTINUE
 # ============================================================
 def process_videos():
+    """
+    Boucle principale :
+    1. Traite tous les hooks présents dans HOOKS
+    2. Attend 30s et revérifie
+    3. S'arrête seulement si HOOKS est vide 2 fois de suite (1 min d'inactivité)
+    Permet à n8n de générer les hooks en batches de 5 pendant que Render monte les précédents.
+    """
     global is_processing
     now = datetime.datetime.now()
     date_du_jour = now.strftime("%d.%m")
-    day_month_slash = now.strftime("%d/%m")
     local_part2 = "/tmp/partie2.mp4"
     local_part2_clean = "/tmp/partie2_clean.mp4"
 
     try:
         drive_service, gc = get_google_services()
         master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
-        video_data = load_video_data_from_sheet(gc)
-
-        # Numérotation continue sur la journée : compter les vidéos du jour dans le master sheet
-        existing_rows = master_ws.get_all_values()
-        # Compter les lignes dont le Ad_Name commence par la date du jour (ex: "15.03_V")
-        today_prefix = f"{date_du_jour}_V"
-        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-        start_index = existing_today + 1  # V1 le matin, continue là où on s'est arrêté le soir
-        print(f"📊 Master sheet: {existing_today} vidéos aujourd'hui ({date_du_jour}) → prochaine numérotation à partir de V{start_index}")
 
         # Préparer les dossiers Drive
         today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
         edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
         original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
 
-        # Télécharger et ré-encoder Part2 (une seule fois)
-        if os.path.exists(local_part2):
-            os.remove(local_part2)
-        if os.path.exists(local_part2_clean):
-            os.remove(local_part2_clean)
+        # Télécharger et ré-encoder Part2 (une seule fois pour toute la session)
+        for p in [local_part2, local_part2_clean]:
+            if os.path.exists(p):
+                os.remove(p)
         drive_download_file(drive_service, PART2_FILE_ID, local_part2)
-        # Ré-encoder Part2 pour garantir la compatibilité
         reencode_video(local_part2, local_part2_clean)
         print("✅ Part2 téléchargée et ré-encodée")
 
-        # Lister les vidéos dans HOOKS
-        hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
-        if not hook_files:
-            send_telegram("✅ *Video Editor* — Aucune vidéo dans HOOKS. Rien à traiter.")
-            return
-
-        send_telegram(f"🎬 *Video Editor* — Début du montage de *{len(hook_files)} vidéo(s)*...")
-
         success_count = 0
         error_count = 0
-
-        for loop_idx, f in enumerate(hook_files, start=0):
-            global_index = start_index + loop_idx  # numérotation continue
-            hook_id   = f["id"]
-            hook_name = f["name"]
-            nom_final = f"{date_du_jour}_V{global_index}.mp4"
-            local_hook      = f"/tmp/hook_{global_index}.mp4"
-            local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
-            local_hook_cut  = f"/tmp/hook_cut_{global_index}.mp4"
-            local_concat    = f"/tmp/concat_{global_index}.mp4"
-            local_audio     = f"/tmp/audio_{global_index}.wav"
-            local_srt       = f"/tmp/subs_{global_index}.srt"
-            local_out       = f"/tmp/out_{global_index}.mp4"
-            concat_list     = f"/tmp/list_{global_index}.txt"
-
-            # Données dynamiques depuis le sheet (titre, headline, primary_text, video_prompt)
-            if loop_idx < len(video_data):
-                vd = video_data[loop_idx]
-                video_title    = vd["title"] or DEFAULT_TITLE
-                video_headline = vd["headline"]
-                video_primary  = vd["primary_text"]
-                video_prompt   = vd["video_prompt"]
-            else:
-                video_title    = DEFAULT_TITLE
-                video_headline = ""
-                video_primary  = ""
-                video_prompt   = ""
-
-            try:
-                # 1. Télécharger le hook
-                drive_download_file(drive_service, hook_id, local_hook)
-                print(f"📥 Hook téléchargé: {hook_name}")
-
-                # 2. Ré-encoder le hook pour garantir la piste vidéo et les keyframes
-                reencode_video(local_hook, local_hook_clean)
-                print(f"🔄 Hook ré-encodé proprement")
-
-                # 3. Vérifier que la piste vidéo est présente
-                if not has_video_stream(local_hook_clean):
-                    raise Exception(f"Pas de piste vidéo dans {hook_name} après ré-encodage")
-
-                hook_duration = get_video_duration(local_hook_clean)
-                print(f"⏱ Durée hook: {hook_duration:.2f}s")
-
-                # 4. Détecter les bornes de parole
-                # Extraire audio du hook pour détecter les bornes de parole
-                local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", local_hook_clean,
-                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                    local_hook_audio
-                ], check=True, capture_output=True)
-                start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
-                print(f"🎤 Parole détectée: {start_t:.2f}s → {end_t:.2f}s")
-
-                # 5. Couper le hook (avec ré-encodage pour éviter les problèmes de keyframes)
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", local_hook_clean,
-                    "-ss", str(start_t), "-to", str(end_t),
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-ar", "44100",
-                    local_hook_cut
-                ], check=True, capture_output=True)
-                print(f"✂️ Hook coupé")
-
-                # 6. Vérifier que le hook coupé a bien une piste vidéo
-                if not has_video_stream(local_hook_cut):
-                    raise Exception("Hook coupé sans piste vidéo")
-
-                # 7. Concaténer hook + part2 (les deux sont déjà ré-encodés avec mêmes paramètres)
-                with open(concat_list, "w") as cl:
-                    cl.write(f"file '{local_hook_cut}'\n")
-                    cl.write(f"file '{local_part2_clean}'\n")
-
-                subprocess.run([
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", concat_list,
-                    "-c:v", "libx264", "-c:a", "aac",
-                    "-preset", "fast", "-crf", "23",
-                    "-movflags", "+faststart",
-                    local_concat
-                ], check=True, capture_output=True)
-                print(f"🔗 Concaténation OK")
-
-                # 8. Vérifier que la concaténation a une piste vidéo
-                if not has_video_stream(local_concat):
-                    raise Exception("Vidéo concaténée sans piste vidéo")
-
-                # 9. Extraire l'audio pour Whisper
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", local_concat,
-                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                    local_audio
-                ], check=True, capture_output=True)
-
-                # 10. Générer les sous-titres SRT
-                srt_content = generate_srt(local_audio)
-                with open(local_srt, "w", encoding="utf-8") as sf:
-                    sf.write(srt_content)
-                print(f"📝 Sous-titres générés")
-
-                # 11. Brûler les sous-titres + titre overlay avec FFmpeg
-                # Couper le titre en 2 lignes si trop long (max ~22 chars par ligne)
-                title_clean = video_title.replace("\n", " ").strip()
-                words_t = title_clean.split()
-                line1, line2 = "", ""
-                mid = len(words_t) // 2
-                for cut in range(mid, len(words_t)):
-                    candidate1 = " ".join(words_t[:cut])
-                    candidate2 = " ".join(words_t[cut:])
-                    if len(candidate1) <= 22:
-                        line1, line2 = candidate1, candidate2
-                        break
-                if not line1:
-                    line1 = title_clean
-                    line2 = ""
-
-                def esc(s):
-                    return (s.replace("\\", "\\\\")
-                             .replace("'", "\u2019")
-                             .replace(":", "\\:")
-                             .replace("%", "%%"))
-
-                # Police pour le titre
-                # fontsize=50 : assez grand pour être lisible, tient dans la largeur sans déborder
-                if os.path.exists(FONT_PATH):
-                    font_path_esc = FONT_PATH.replace(':', '\\:')
-                    font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=50"
-                else:
-                    font_base = "fontcolor=black:fontsize=50"
-
-                # Construire le filtre titre
-                # Style exact du Colab : fond blanc adapté à la largeur du texte (pas pleine largeur)
-                # drawtext box=1 + boxborderw simule TextClip method="label" bg_color="white"
-                if line2:
-                    title_filter = (
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:"
-                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)',"
-                        f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=848:"
-                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
-                    )
-                else:
-                    title_filter = (
-                        f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=800:"
-                        f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
-                    )
-
-                # Construire les filtres drawtext pour les sous-titres
-                # Whisper a transcrit l’audio complet (hook + Part2)
-                # Les timestamps couvrent donc toute la vidéo
-                sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
-
-                # Filtre complet : titre + sous-titres
-                all_filters = [title_filter] + sub_filters
-                vf_filter = ",".join(all_filters)
-
-                result = subprocess.run([
-                    "ffmpeg", "-y", "-i", local_concat,
-                    "-vf", vf_filter,
-                    "-c:v", "libx264", "-c:a", "aac",
-                    "-preset", "fast", "-crf", "23",
-                    "-movflags", "+faststart",
-                    local_out
-                ], capture_output=True, text=True)
-
-                if result.returncode != 0:
-                    print(f"⚠️ Erreur overlay: {result.stderr[-500:]}")
-                    # Fallback: upload sans overlay si erreur
-                    import shutil
-                    shutil.copy(local_concat, local_out)
-
-                # 12. Vérification finale
-                if not has_video_stream(local_out):
-                    raise Exception("Fichier final sans piste vidéo")
-
-                final_duration = get_video_duration(local_out)
-                print(f"✅ Vidéo finale: {final_duration:.2f}s avec piste vidéo")
-
-                # 13. Upload vers Drive
-                out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
-                drive_move_file(drive_service, hook_id, original_folder_id)
-
-                # 14. Log dans le Master Sheet (toutes les colonnes)
-                # Numérotation campaign/adset basée sur global_index
-                version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-                campaign_name = f"C{date_du_jour}_{version:02d}"
-                adset_name    = f"adset{version}_{date_du_jour}"
-                drive_link, direct_link = make_drive_links(out_id)
-                master_ws.append_row(
-                    [
-                        nom_final.replace(".mp4", ""),  # Ad_Name
-                        drive_link,                      # Drive_Share_Link
-                        direct_link,                     # Direct_Download_Link
-                        campaign_name,                   # Campaign_Name
-                        adset_name,                      # AdSet_Name
-                        video_primary,                   # Primary_Text
-                        video_headline,                  # Headline
-                        video_prompt,                    # Video_Prompt
-                        "ready",                         # status
-                    ],
-                    value_input_option="USER_ENTERED"
-                )
-
-                success_count += 1
-                print(f"✅ {nom_final} monté et uploadé avec succès")
-
-            except Exception as e:
-                error_count += 1
-                print(f"❌ Erreur sur {hook_name}: {e}")
-                send_telegram(f"⚠️ Erreur sur {hook_name}: {str(e)[:150]}")
-
-            finally:
-                for path in [local_hook, local_hook_clean, local_hook_cut, local_concat,
-                             local_audio, local_srt, local_out, concat_list]:
-                    try:
-                        if os.path.exists(path):
-                            os.remove(path)
-                    except:
-                        pass
-
-        # Après chaque batch : revérifier HOOKS (boucle continue)
-        # Attend 30s et revérifie si de nouveaux hooks sont arrivés
         empty_checks = 0
-        while empty_checks < 2:  # S'arrête seulement si HOOKS vide 2 fois de suite
-            import time
-            print("⏳ Attente 30s avant de revérifier HOOKS...")
-            time.sleep(30)
-            new_hooks = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
-            if not new_hooks:
+
+        # Numérotation : compter les vidéos du jour déjà dans le master sheet
+        today_prefix = f"{date_du_jour}_V"
+        existing_rows = master_ws.get_all_values()
+        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+        global_index = existing_today + 1
+        print(f"📊 {existing_today} vidéos aujourd'hui → prochaine: V{global_index}")
+
+        # ── Boucle principale ────────────────────────────────────────────────
+        while True:
+            hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
+
+            if not hook_files:
                 empty_checks += 1
                 print(f"📭 HOOKS vide ({empty_checks}/2)")
-            else:
-                empty_checks = 0  # Reset si de nouveaux hooks trouvés
-                print(f"🎬 {len(new_hooks)} nouveau(x) hook(s) trouvé(s) — on continue!")
-                # Recalculer la numérotation
-                existing_rows = master_ws.get_all_values()
-                existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-                start_index = existing_today + 1
-                for loop_idx, f in enumerate(new_hooks, start=0):
-                    global_index = start_index + loop_idx
-                    hook_id   = f["id"]
-                    hook_name = f["name"]
-                    nom_final = f"{date_du_jour}_V{global_index}.mp4"
-                    local_hook      = f"/tmp/hook_{global_index}.mp4"
-                    local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
-                    local_hook_cut  = f"/tmp/hook_cut_{global_index}.mp4"
-                    local_concat    = f"/tmp/concat_{global_index}.mp4"
-                    local_audio     = f"/tmp/audio_{global_index}.wav"
-                    local_srt       = f"/tmp/subs_{global_index}.srt"
-                    local_out       = f"/tmp/out_{global_index}.mp4"
-                    concat_list     = f"/tmp/list_{global_index}.txt"
-                    if loop_idx < len(video_data):
-                        vd = video_data[loop_idx]
-                        video_title    = vd["title"] or DEFAULT_TITLE
-                        video_headline = vd["headline"]
-                        video_primary  = vd["primary_text"]
-                        video_prompt   = vd["video_prompt"]
-                    else:
-                        video_title    = DEFAULT_TITLE
-                        video_headline = ""
-                        video_primary  = ""
-                        video_prompt   = ""
-                    # Réutiliser le même bloc de traitement (appel récursif simplifié)
-                    try:
-                        drive_download_file(drive_service, hook_id, local_hook)
-                        reencode_video(local_hook, local_hook_clean)
-                        if not has_video_stream(local_hook_clean):
-                            raise Exception(f"Pas de piste vidéo dans {hook_name}")
-                        hook_duration = get_video_duration(local_hook_clean)
-                        local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
-                        subprocess.run(["ffmpeg","-y","-i",local_hook_clean,"-vn","-acodec","pcm_s16le","-ar","16000","-ac","1",local_hook_audio], check=True, capture_output=True)
-                        start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
-                        subprocess.run(["ffmpeg","-y","-i",local_hook_clean,"-ss",str(start_t),"-to",str(end_t),"-c:v","libx264","-preset","fast","-crf","23","-c:a","aac","-ar","44100",local_hook_cut], check=True, capture_output=True)
-                        if not has_video_stream(local_hook_cut):
-                            raise Exception("Hook coupé sans piste vidéo")
-                        with open(concat_list, "w") as cl:
-                            cl.write(f"file '{local_hook_cut}'\nfile '{local_part2_clean}'\n")
-                        subprocess.run(["ffmpeg","-y","-f","concat","-safe","0","-i",concat_list,"-c:v","libx264","-c:a","aac","-preset","fast","-crf","23","-movflags","+faststart",local_concat], check=True, capture_output=True)
-                        if not has_video_stream(local_concat):
-                            raise Exception("Vidéo concaténée sans piste vidéo")
-                        subprocess.run(["ffmpeg","-y","-i",local_concat,"-vn","-acodec","pcm_s16le","-ar","16000","-ac","1",local_audio], check=True, capture_output=True)
-                        srt_content = generate_srt(local_audio)
-                        with open(local_srt, "w", encoding="utf-8") as sf:
-                            sf.write(srt_content)
-                        title_clean = video_title.replace("\n", " ").strip()
-                        words_t = title_clean.split()
-                        line1, line2 = "", ""
-                        mid = len(words_t) // 2
-                        for cut in range(mid, len(words_t)):
-                            candidate1 = " ".join(words_t[:cut])
-                            candidate2 = " ".join(words_t[cut:])
-                            if len(candidate1) <= 22:
-                                line1, line2 = candidate1, candidate2
-                                break
-                        if not line1:
-                            line1 = title_clean
-                        def esc2(s):
-                            return s.replace("'", "\u2019").replace('"', '').replace(':', '\\:')
-                        font_base2 = f"fontfile={FONT_PATH.replace(':', chr(92)+':')}:fontsize=50:fontcolor=black:bold=1" if os.path.exists(FONT_PATH) else "fontsize=50:fontcolor=black:bold=1"
-                        if line2:
-                            title_filter = (f"drawtext=text='{esc2(line1)}':{font_base2}:x=(w-tw)/2:y=755:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'," + f"drawtext=text='{esc2(line2)}':{font_base2}:x=(w-tw)/2:y=820:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'")
-                        else:
-                            title_filter = f"drawtext=text='{esc2(line1)}':{font_base2}:x=(w-tw)/2:y=800:box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
-                        sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
-                        all_filters = [title_filter] + sub_filters
-                        vf_filter = ",".join(all_filters)
-                        result2 = subprocess.run(["ffmpeg","-y","-i",local_concat,"-vf",vf_filter,"-c:v","libx264","-c:a","aac","-preset","fast","-crf","23","-movflags","+faststart",local_out], capture_output=True, text=True)
-                        if result2.returncode != 0:
-                            import shutil; shutil.copy(local_concat, local_out)
-                        if not has_video_stream(local_out):
-                            raise Exception("Fichier final sans piste vidéo")
-                        out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
-                        drive_move_file(drive_service, hook_id, original_folder_id)
-                        version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-                        campaign_name = f"C{date_du_jour}_{version:02d}"
-                        adset_name    = f"adset{version}_{date_du_jour}"
-                        drive_link, direct_link = make_drive_links(out_id)
-                        master_ws.append_row([nom_final.replace(".mp4",""), drive_link, direct_link, campaign_name, adset_name, video_primary, video_headline, video_prompt, "ready"], value_input_option="USER_ENTERED")
-                        success_count += 1
-                        print(f"✅ {nom_final} monté (boucle continue)")
-                    except Exception as e2:
-                        error_count += 1
-                        print(f"❌ Erreur {hook_name}: {e2}")
-                        send_telegram(f"⚠️ Erreur {hook_name}: {str(e2)[:150]}")
-                    finally:
-                        for path in [local_hook, local_hook_clean, local_hook_cut, local_concat, local_audio, local_srt, local_out, concat_list]:
-                            try:
-                                if os.path.exists(path): os.remove(path)
-                            except: pass
+                if empty_checks >= 2:
+                    print("🏁 HOOKS vide 2 fois de suite — arrêt de la boucle")
+                    break
+                print("⏳ Attente 30s avant de revérifier...")
+                time.sleep(30)
+                continue
 
-        # Rapport final Telegram
+            # Des hooks sont disponibles → on traite
+            empty_checks = 0
+            send_telegram(f"🎬 *Video Editor* — {len(hook_files)} hook(s) à monter (V{global_index}→V{global_index + len(hook_files) - 1})...")
+
+            for hook_file in hook_files:
+                ok = process_single_hook(
+                    drive_service=drive_service,
+                    master_ws=master_ws,
+                    hook_file=hook_file,
+                    global_index=global_index,
+                    date_du_jour=date_du_jour,
+                    edited_folder_id=edited_folder_id,
+                    original_folder_id=original_folder_id,
+                    local_part2_clean=local_part2_clean,
+                )
+                if ok:
+                    success_count += 1
+                else:
+                    error_count += 1
+                global_index += 1
+
+            # Après le batch : attendre 30s et revérifier
+            print("⏳ Batch terminé — attente 30s avant de revérifier HOOKS...")
+            time.sleep(30)
+
+        # Rapport final
         msg = f"🚀 *Video Editor — Mission accomplie!*\n\n"
         msg += f"✅ {success_count} vidéo(s) montée(s) avec succès\n"
         if error_count > 0:
@@ -760,6 +655,8 @@ def process_videos():
     except Exception as e:
         send_telegram(f"❌ *Video Editor — Erreur critique:* {str(e)[:200]}")
         print(f"Erreur critique: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         is_processing = False
 

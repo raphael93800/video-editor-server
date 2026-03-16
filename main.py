@@ -4,7 +4,7 @@ import datetime
 import subprocess
 import threading
 import tempfile
-import whisper
+import openai
 import gspread
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -29,6 +29,7 @@ VIDEOS_PER_CAMPAIGN = int(os.environ.get("VIDEOS_PER_CAMPAIGN", "20"))
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
 GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
@@ -241,15 +242,20 @@ def reencode_video(input_path, output_path):
 # ============================================================
 # FFMPEG : détecter start/end de la parole via Whisper
 # ============================================================
-def get_speech_bounds(model, video_path, video_duration):
-    result = model.transcribe(video_path, word_timestamps=True)
-    words = []
-    for segment in result.get("segments", []):
-        words.extend(segment.get("words", []))
+def get_speech_bounds(audio_path, video_duration):
+    """Détecte les bornes de parole via l'API OpenAI Whisper."""
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word"]
+        )
+    words = result.words or []
     if words:
-        start_t = max(0, words[0]["start"] - 0.1)
-        # +0.8s après le dernier mot comme dans le Colab original
-        end_t = min(words[-1]["end"] + 0.8, video_duration - 0.05)
+        start_t = max(0, words[0].start - 0.1)
+        end_t = min(words[-1].end + 0.8, video_duration - 0.05)
     else:
         start_t, end_t = 0, video_duration
     return start_t, end_t, result
@@ -257,15 +263,20 @@ def get_speech_bounds(model, video_path, video_duration):
 # ============================================================
 # FFMPEG : générer les sous-titres au format SRT
 # ============================================================
-def generate_srt(model, audio_path):
-    """Transcrit l'audio complet (hook+Part2) et génère un SRT.
+def generate_srt(audio_path):
+    """Transcrit l'audio complet (hook+Part2) et génère un SRT via API OpenAI Whisper.
     Chunks de 5 mots comme dans le script Colab original.
     Les timestamps sont relatifs au début de la vidéo concaténée.
     """
-    result = model.transcribe(audio_path, word_timestamps=True)
-    words_all = []
-    for segment in result.get("segments", []):
-        words_all.extend(segment.get("words", []))
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word"]
+        )
+    words_all = result.words or []
 
     srt_lines = []
     idx = 1
@@ -406,7 +417,6 @@ def process_videos():
 
         send_telegram(f"🎬 *Video Editor* — Début du montage de *{len(hook_files)} vidéo(s)*...")
 
-        model = whisper.load_model("tiny")
         success_count = 0
         error_count = 0
 
@@ -454,7 +464,14 @@ def process_videos():
                 print(f"⏱ Durée hook: {hook_duration:.2f}s")
 
                 # 4. Détecter les bornes de parole
-                start_t, end_t, _ = get_speech_bounds(model, local_hook_clean, hook_duration)
+                # Extraire audio du hook pour détecter les bornes de parole
+                local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", local_hook_clean,
+                    "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    local_hook_audio
+                ], check=True, capture_output=True)
+                start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
                 print(f"🎤 Parole détectée: {start_t:.2f}s → {end_t:.2f}s")
 
                 # 5. Couper le hook (avec ré-encodage pour éviter les problèmes de keyframes)
@@ -498,7 +515,7 @@ def process_videos():
                 ], check=True, capture_output=True)
 
                 # 10. Générer les sous-titres SRT
-                srt_content = generate_srt(model, local_audio)
+                srt_content = generate_srt(local_audio)
                 with open(local_srt, "w", encoding="utf-8") as sf:
                     sf.write(srt_content)
                 print(f"📝 Sous-titres générés")

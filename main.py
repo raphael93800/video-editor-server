@@ -406,7 +406,7 @@ def process_videos():
 
         send_telegram(f"🎬 *Video Editor* — Début du montage de *{len(hook_files)} vidéo(s)*...")
 
-        model = whisper.load_model("base")
+        model = whisper.load_model("tiny")
         success_count = 0
         error_count = 0
 

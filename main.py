@@ -539,7 +539,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
                 video_primary,                   # Primary_Text
                 video_headline,                  # Headline
                 video_prompt,                    # Video_Prompt
-                "ready",                         # status
+                # statut laissé vide — mis à "ready" par n8n quand lancé sur Meta
             ],
             value_input_option="USER_ENTERED"
         )
@@ -661,6 +661,119 @@ def process_videos():
         is_processing = False
 
 # ============================================================
+# ARCHIVAGE AUTOMATIQUE — Veo → old prompt (lignes done depuis +24h)
+# ============================================================
+VIDEOS_SHEET_URL = os.environ.get("VIDEOS_SHEET_URL", "https://docs.google.com/spreadsheets/d/13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g/edit")
+
+def archive_old_prompts():
+    """
+    Vérifie le sheet "Veo" du spreadsheet Vidéos IA n8n.
+    Déplace vers l'onglet "old prompt" toutes les lignes dont :
+    - STATUS = "done"
+    - La date dans la colonne A est antérieure à aujourd'hui (= plus de 24h)
+    Tourne automatiquement toutes les heures.
+    """
+    try:
+        _, gc = get_google_services()
+        spreadsheet = gc.open_by_url(VIDEOS_SHEET_URL)
+
+        # Récupérer les deux onglets
+        try:
+            veo_ws = spreadsheet.worksheet("Veo")
+        except Exception:
+            print("⚠️ Onglet 'Veo' introuvable — archivage ignoré")
+            return
+
+        try:
+            old_ws = spreadsheet.worksheet("old prompt")
+        except Exception:
+            # Créer l'onglet s'il n'existe pas
+            old_ws = spreadsheet.add_worksheet(title="old prompt", rows=1000, cols=20)
+            print("📋 Onglet 'old prompt' créé")
+
+        all_rows = veo_ws.get_all_values()
+        if not all_rows:
+            return
+
+        headers = all_rows[0]
+        data_rows = all_rows[1:]
+
+        # Trouver les colonnes date et STATUS
+        headers_lower = [h.lower().strip() for h in headers]
+        date_col = next((i for i, h in enumerate(headers_lower) if "date" in h), 0)
+        status_col = next((i for i, h in enumerate(headers_lower) if "status" in h), None)
+
+        if status_col is None:
+            print("⚠️ Colonne STATUS introuvable — archivage ignoré")
+            return
+
+        today = datetime.date.today()
+        rows_to_archive = []   # (row_index_in_sheet, row_data)
+        rows_to_keep    = []
+
+        for i, row in enumerate(data_rows):
+            status = row[status_col].strip().lower() if len(row) > status_col else ""
+            if status != "done":
+                rows_to_keep.append(row)
+                continue
+
+            # Vérifier la date — formats acceptés : dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, d/m
+            date_val = row[date_col].strip() if len(row) > date_col else ""
+            row_date = None
+            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d/%m", "%m/%d"):
+                try:
+                    parsed = datetime.datetime.strptime(date_val, fmt)
+                    # Si le format ne contient pas l'année, on suppose l'année courante
+                    if "%Y" not in fmt:
+                        parsed = parsed.replace(year=today.year)
+                    row_date = parsed.date()
+                    break
+                except ValueError:
+                    continue
+
+            # Si pas de date ou date < aujourd'hui → archiver
+            if row_date is None or row_date < today:
+                rows_to_archive.append(row)
+            else:
+                rows_to_keep.append(row)
+
+        if not rows_to_archive:
+            print("📋 Archivage : aucune ligne à déplacer")
+            return
+
+        # Ajouter les lignes dans old prompt
+        # S'assurer que l'en-tête existe dans old prompt
+        old_data = old_ws.get_all_values()
+        if not old_data:
+            old_ws.append_row(headers, value_input_option="USER_ENTERED")
+
+        for row in rows_to_archive:
+            old_ws.append_row(row, value_input_option="USER_ENTERED")
+
+        # Réécrire Veo sans les lignes archivées
+        veo_ws.clear()
+        veo_ws.append_row(headers, value_input_option="USER_ENTERED")
+        for row in rows_to_keep:
+            veo_ws.append_row(row, value_input_option="USER_ENTERED")
+
+        print(f"✅ Archivage : {len(rows_to_archive)} ligne(s) déplacée(s) vers 'old prompt'")
+        send_telegram(f"📦 *Archivage automatique* — {len(rows_to_archive)} prompt(s) déplacé(s) vers 'old prompt'")
+
+    except Exception as e:
+        print(f"❌ Erreur archivage: {e}")
+
+
+def archive_loop():
+    """Thread qui tourne toutes les heures pour archiver les vieux prompts."""
+    # Première vérification 1h après le démarrage
+    time.sleep(3600)
+    while True:
+        print("🕐 Vérification archivage automatique...")
+        archive_old_prompts()
+        time.sleep(3600)  # toutes les heures
+
+
+# ============================================================
 # ENDPOINTS
 # ============================================================
 @app.get("/")
@@ -679,6 +792,16 @@ def trigger_processing(background_tasks: BackgroundTasks):
 @app.get("/status")
 def status():
     return {"processing": is_processing}
+
+@app.post("/archive")
+def trigger_archive(background_tasks: BackgroundTasks):
+    """Endpoint manuel pour déclencher l'archivage immédiatement."""
+    background_tasks.add_task(archive_old_prompts)
+    return JSONResponse({"status": "started", "message": "Archivage lancé en arrière-plan"})
+
+# Démarrer le thread d'archivage automatique au lancement du serveur
+_archive_thread = threading.Thread(target=archive_loop, daemon=True)
+_archive_thread.start()
 
 if __name__ == "__main__":
     import uvicorn

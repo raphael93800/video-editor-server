@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+openai
 openai-whisper
 gspread
 google-auth

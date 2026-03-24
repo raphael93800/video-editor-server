@@ -23,6 +23,7 @@ MASTER_SHEET_URL    = os.environ.get("MASTER_SHEET_URL",    "https://docs.google
 HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
 RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
 PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
+PART2_UK_FILE_ID    = os.environ.get("PART2_UK_FILE_ID",    "1_G7pAuZx-5-xCFEsurI5CXiQVQfM2Csu")
 DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no one told you about")
 VIDEOS_PER_CAMPAIGN = int(os.environ.get("VIDEOS_PER_CAMPAIGN", "20"))
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
@@ -563,19 +564,24 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
 # ============================================================
 # MONTAGE PRINCIPAL — BOUCLE CONTINUE
 # ============================================================
-def process_videos():
+def process_videos(region="FR"):
     """
     Boucle principale :
     1. Traite tous les hooks présents dans HOOKS
     2. Attend 30s et revérifie
     3. S'arrête seulement si HOOKS est vide 2 fois de suite (1 min d'inactivité)
     Permet à n8n de générer les hooks en batches de 5 pendant que Render monte les précédents.
+
+    region: "FR" (default) ou "UK" — sélectionne la vidéo Part2 correspondante.
     """
     global is_processing
     now = datetime.datetime.now()
     date_du_jour = now.strftime("%d.%m")
     local_part2 = "/tmp/partie2.mp4"
     local_part2_clean = "/tmp/partie2_clean.mp4"
+
+    part2_id = PART2_UK_FILE_ID if region.upper() == "UK" else PART2_FILE_ID
+    print(f"🌍 Région: {region.upper()} — Part2 ID: {part2_id}")
 
     try:
         drive_service, gc = get_google_services()
@@ -590,9 +596,9 @@ def process_videos():
         for p in [local_part2, local_part2_clean]:
             if os.path.exists(p):
                 os.remove(p)
-        drive_download_file(drive_service, PART2_FILE_ID, local_part2)
+        drive_download_file(drive_service, part2_id, local_part2)
         reencode_video(local_part2, local_part2_clean)
-        print("✅ Part2 téléchargée et ré-encodée")
+        print(f"✅ Part2 ({region.upper()}) téléchargée et ré-encodée")
 
         success_count = 0
         error_count = 0
@@ -774,6 +780,74 @@ def archive_loop():
 
 
 # ============================================================
+# TEST — Monte un seul hook pour vérifier le pipeline
+# ============================================================
+def process_single_test(region="FR"):
+    """Monte uniquement le premier hook trouvé dans HOOKS, sans boucle."""
+    global is_processing
+    now = datetime.datetime.now()
+    date_du_jour = now.strftime("%d.%m")
+    local_part2 = "/tmp/partie2.mp4"
+    local_part2_clean = "/tmp/partie2_clean.mp4"
+
+    part2_id = PART2_UK_FILE_ID if region.upper() == "UK" else PART2_FILE_ID
+    print(f"🧪 TEST — Région: {region.upper()} — Part2 ID: {part2_id}")
+
+    try:
+        drive_service, gc = get_google_services()
+        master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
+
+        today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
+        edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
+        original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
+
+        for p in [local_part2, local_part2_clean]:
+            if os.path.exists(p):
+                os.remove(p)
+        drive_download_file(drive_service, part2_id, local_part2)
+        reencode_video(local_part2, local_part2_clean)
+        print(f"✅ Part2 ({region.upper()}) téléchargée et ré-encodée")
+
+        hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
+        if not hook_files:
+            msg = "🧪 TEST — Aucun hook trouvé dans HOOKS"
+            print(msg)
+            send_telegram(msg)
+            return
+
+        today_prefix = f"{date_du_jour}_V"
+        existing_rows = master_ws.get_all_values()
+        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+        global_index = existing_today + 1
+
+        hook_file = hook_files[0]
+        send_telegram(f"🧪 *TEST* — Montage de {hook_file['name']} (Part2 {region.upper()})...")
+
+        ok = process_single_hook(
+            drive_service=drive_service,
+            master_ws=master_ws,
+            hook_file=hook_file,
+            global_index=global_index,
+            date_du_jour=date_du_jour,
+            edited_folder_id=edited_folder_id,
+            original_folder_id=original_folder_id,
+            local_part2_clean=local_part2_clean,
+        )
+
+        if ok:
+            send_telegram(f"🧪✅ *TEST réussi* — {hook_file['name']} monté avec Part2 {region.upper()}")
+        else:
+            send_telegram(f"🧪❌ *TEST échoué* — {hook_file['name']}")
+
+    except Exception as e:
+        send_telegram(f"🧪❌ *TEST — Erreur:* {str(e)[:200]}")
+        print(f"Erreur test: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        is_processing = False
+
+# ============================================================
 # ENDPOINTS
 # ============================================================
 @app.get("/")
@@ -781,17 +855,44 @@ def root():
     return {"status": "Video Editor Server running", "processing": is_processing}
 
 @app.post("/process")
-def trigger_processing(background_tasks: BackgroundTasks):
+def trigger_processing(background_tasks: BackgroundTasks, region: str = "FR"):
+    """
+    Lance le montage de tous les hooks dans HOOKS.
+    Paramètre region : "FR" (défaut) ou "UK" pour utiliser la partie2 UK.
+    Exemple: POST /process?region=UK
+    """
     global is_processing
     if is_processing:
         return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
     is_processing = True
-    background_tasks.add_task(process_videos)
-    return JSONResponse({"status": "started", "message": "Montage démarré en arrière-plan"})
+    background_tasks.add_task(process_videos, region)
+    return JSONResponse({
+        "status": "started",
+        "region": region.upper(),
+        "message": f"Montage démarré en arrière-plan (Part2 {region.upper()})"
+    })
 
 @app.get("/status")
 def status():
     return {"processing": is_processing}
+
+@app.post("/test")
+def trigger_test(background_tasks: BackgroundTasks, region: str = "FR"):
+    """
+    Monte UNE seule vidéo (la première dans HOOKS) pour tester.
+    Paramètre region : "FR" (défaut) ou "UK".
+    Exemple: POST /test?region=UK
+    """
+    global is_processing
+    if is_processing:
+        return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
+    is_processing = True
+    background_tasks.add_task(process_single_test, region)
+    return JSONResponse({
+        "status": "started",
+        "region": region.upper(),
+        "message": f"Test d'un seul hook lancé (Part2 {region.upper()})"
+    })
 
 @app.post("/archive")
 def trigger_archive(background_tasks: BackgroundTasks):

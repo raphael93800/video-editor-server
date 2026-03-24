@@ -37,19 +37,25 @@ OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 # Each country has its own HOOKS subfolder, RESULTS subfolder,
 # Part2 video, and Master Sheet tab.
 # Subfolder IDs can be set via env vars, or will be auto-created
-# as subfolders of HOOKS_FOLDER_ID / RESULTS_FOLDER_ID.
+# inside the parent HOOK / RESULTS folders with the correct names.
+# Drive folder names: "HOOKS/USA", "HOOKS/UK" inside HOOK parent,
+#                     "RESULTS/USA", "RESULTS/UK" inside RESULTS parent.
 COUNTRY_CONFIG = {
     "USA": {
         "hooks_folder_id":   os.environ.get("HOOKS_USA_FOLDER_ID", ""),
+        "hooks_folder_name": "HOOKS/USA",
         "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", ""),
+        "results_folder_name": "RESULTS/USA",
         "part2_file_id":     PART2_FILE_ID,
-        "master_tab":        os.environ.get("MASTER_TAB_USA", "USA"),
+        "master_tab":        os.environ.get("MASTER_TAB_USA", "To launch (USA)"),
     },
     "UK": {
         "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", ""),
+        "hooks_folder_name": "HOOKS/UK",
         "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", ""),
+        "results_folder_name": "RESULTS/UK",
         "part2_file_id":     PART2_UK_FILE_ID,
-        "master_tab":        os.environ.get("MASTER_TAB_UK", "UK"),
+        "master_tab":        os.environ.get("MASTER_TAB_UK", "To launch (UK)"),
     },
 }
 
@@ -209,25 +215,30 @@ def make_drive_links(file_id):
 # ============================================================
 def ensure_country_folders(drive_service):
     """
-    For each country in COUNTRY_CONFIG, ensure HOOKS/<country> and
-    RESULTATS/<country> subfolders exist. If the env var is empty,
-    create the subfolder under the parent HOOKS/RESULTS folder.
+    For each country in COUNTRY_CONFIG, ensure the HOOKS and RESULTS
+    subfolders exist with the correct names (e.g. "HOOKS/USA", "RESULTS/UK").
+    If the env var folder ID is empty, find or create the subfolder
+    under the parent HOOKS/RESULTS folder.
     Mutates COUNTRY_CONFIG in-place with resolved folder IDs.
     """
     for country, cfg in COUNTRY_CONFIG.items():
         if not cfg["hooks_folder_id"]:
-            folder_id = drive_get_or_create_folder(drive_service, HOOKS_FOLDER_ID, country)
+            folder_id = drive_get_or_create_folder(
+                drive_service, HOOKS_FOLDER_ID, cfg["hooks_folder_name"]
+            )
             cfg["hooks_folder_id"] = folder_id
-            print(f"📁 HOOKS/{country} → {folder_id}")
+            print(f"📁 {cfg['hooks_folder_name']} → {folder_id}")
         else:
-            print(f"📁 HOOKS/{country} → {cfg['hooks_folder_id']} (env)")
+            print(f"📁 {cfg['hooks_folder_name']} → {cfg['hooks_folder_id']} (env)")
 
         if not cfg["results_folder_id"]:
-            folder_id = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, country)
+            folder_id = drive_get_or_create_folder(
+                drive_service, RESULTS_FOLDER_ID, cfg["results_folder_name"]
+            )
             cfg["results_folder_id"] = folder_id
-            print(f"📁 RESULTATS/{country} → {folder_id}")
+            print(f"📁 {cfg['results_folder_name']} → {folder_id}")
         else:
-            print(f"📁 RESULTATS/{country} → {cfg['results_folder_id']} (env)")
+            print(f"📁 {cfg['results_folder_name']} → {cfg['results_folder_id']} (env)")
 
 # ============================================================
 # MASTER SHEET : get or create tab per country
@@ -776,109 +787,6 @@ def process_videos(country=None):
         is_processing = False
 
 # ============================================================
-# ARCHIVAGE AUTOMATIQUE — Veo → old prompt (lignes done depuis +24h)
-# ============================================================
-VIDEOS_SHEET_URL = os.environ.get("VIDEOS_SHEET_URL", "https://docs.google.com/spreadsheets/d/13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g/edit")
-
-def archive_old_prompts():
-    """
-    Vérifie le sheet "Veo" du spreadsheet Vidéos IA n8n.
-    Déplace vers l'onglet "old prompt" toutes les lignes dont :
-    - STATUS = "done"
-    - La date dans la colonne A est antérieure à aujourd'hui (= plus de 24h)
-    Tourne automatiquement toutes les heures.
-    """
-    try:
-        _, gc = get_google_services()
-        spreadsheet = gc.open_by_url(VIDEOS_SHEET_URL)
-
-        try:
-            veo_ws = spreadsheet.worksheet("Veo")
-        except Exception:
-            print("⚠️ Onglet 'Veo' introuvable — archivage ignoré")
-            return
-
-        try:
-            old_ws = spreadsheet.worksheet("old prompt")
-        except Exception:
-            old_ws = spreadsheet.add_worksheet(title="old prompt", rows=1000, cols=20)
-            print("📋 Onglet 'old prompt' créé")
-
-        all_rows = veo_ws.get_all_values()
-        if not all_rows:
-            return
-
-        headers = all_rows[0]
-        data_rows = all_rows[1:]
-
-        headers_lower = [h.lower().strip() for h in headers]
-        date_col = next((i for i, h in enumerate(headers_lower) if "date" in h), 0)
-        status_col = next((i for i, h in enumerate(headers_lower) if "status" in h), None)
-
-        if status_col is None:
-            print("⚠️ Colonne STATUS introuvable — archivage ignoré")
-            return
-
-        today = datetime.date.today()
-        rows_to_archive = []
-        rows_to_keep    = []
-
-        for i, row in enumerate(data_rows):
-            status = row[status_col].strip().lower() if len(row) > status_col else ""
-            if status != "done":
-                rows_to_keep.append(row)
-                continue
-
-            date_val = row[date_col].strip() if len(row) > date_col else ""
-            row_date = None
-            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d/%m", "%m/%d"):
-                try:
-                    parsed = datetime.datetime.strptime(date_val, fmt)
-                    if "%Y" not in fmt:
-                        parsed = parsed.replace(year=today.year)
-                    row_date = parsed.date()
-                    break
-                except ValueError:
-                    continue
-
-            if row_date is None or row_date < today:
-                rows_to_archive.append(row)
-            else:
-                rows_to_keep.append(row)
-
-        if not rows_to_archive:
-            print("📋 Archivage : aucune ligne à déplacer")
-            return
-
-        old_data = old_ws.get_all_values()
-        if not old_data:
-            old_ws.append_row(headers, value_input_option="USER_ENTERED")
-
-        for row in rows_to_archive:
-            old_ws.append_row(row, value_input_option="USER_ENTERED")
-
-        veo_ws.clear()
-        veo_ws.append_row(headers, value_input_option="USER_ENTERED")
-        for row in rows_to_keep:
-            veo_ws.append_row(row, value_input_option="USER_ENTERED")
-
-        print(f"✅ Archivage : {len(rows_to_archive)} ligne(s) déplacée(s) vers 'old prompt'")
-        send_telegram(f"📦 *Archivage automatique* — {len(rows_to_archive)} prompt(s) déplacé(s) vers 'old prompt'")
-
-    except Exception as e:
-        print(f"❌ Erreur archivage: {e}")
-
-
-def archive_loop():
-    """Thread qui tourne toutes les heures pour archiver les vieux prompts."""
-    time.sleep(3600)
-    while True:
-        print("🕐 Vérification archivage automatique...")
-        archive_old_prompts()
-        time.sleep(3600)
-
-
-# ============================================================
 # TEST — Monte un seul hook pour vérifier le pipeline
 # ============================================================
 def process_single_test(country="USA"):
@@ -1021,16 +929,6 @@ def trigger_test(background_tasks: BackgroundTasks, country: str = "USA"):
         "country": country.upper(),
         "message": f"Test d'un seul hook lancé (HOOKS/{country.upper()})"
     })
-
-@app.post("/archive")
-def trigger_archive(background_tasks: BackgroundTasks):
-    """Endpoint manuel pour déclencher l'archivage immédiatement."""
-    background_tasks.add_task(archive_old_prompts)
-    return JSONResponse({"status": "started", "message": "Archivage lancé en arrière-plan"})
-
-# Démarrer le thread d'archivage automatique au lancement du serveur
-_archive_thread = threading.Thread(target=archive_loop, daemon=True)
-_archive_thread.start()
 
 if __name__ == "__main__":
     import uvicorn

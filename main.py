@@ -571,22 +571,104 @@ def mark_prompt_done(gc, country_cfg, row_index):
         ws.update_cell(row_index, col, "done")
 
 # ============================================================
-# GENERATE + EDIT PIPELINE (all-in-one)
+# GENERATE + EDIT PIPELINE (parallel generation, edit-on-ready)
 # ============================================================
+def process_ready_video(task, drive_service, gc, c_name, c_cfg,
+                        local_part2_clean, edited_folder_id, original_folder_id,
+                        master_ws, date_du_jour):
+    """
+    Download, upload original, edit, upload edited, log, mark done.
+    Called as soon as a kie.ai task finishes.
+    """
+    p_data = task["prompt_data"]
+    vid_index = task["vid_index"]
+    video_url = task["video_url"]
+    row_index = p_data["row_index"]
+    prompt_text = p_data["prompt"]
+    nom_final = f"{date_du_jour}_V{vid_index}.mp4"
+
+    local_hook_raw = f"/tmp/hook_raw_{c_name}_{vid_index}.mp4"
+    local_edited = None
+
+    try:
+        # 1) Download generated video
+        kie_download_video(video_url, local_hook_raw)
+
+        # 2) Upload original
+        orig_filename = f"veo_{datetime.datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}.mp4"
+        drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
+        print(f"  [{c_name}] Original uploaded: {orig_filename}")
+
+        # 3) Edit
+        metadata = {
+            "title": p_data["title_of_video"] or DEFAULT_TITLE,
+            "headline": p_data["headline_meta"],
+            "primary_text": p_data["primary_text"],
+            "prompt": prompt_text,
+        }
+        local_edited = edit_single_video(
+            local_hook_raw, local_part2_clean, metadata, c_name, vid_index
+        )
+
+        # 4) Upload edited
+        out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
+        print(f"  [{c_name}] Edited uploaded: {nom_final}")
+
+        # 5) Log in Master Sheet
+        version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+        campaign_name = f"C{date_du_jour}_{c_name}_{version:02d}"
+        adset_name    = f"adset{version}_{c_name}_{date_du_jour}"
+        drive_link, direct_link = make_drive_links(out_id)
+        master_ws.append_row(
+            [
+                nom_final.replace(".mp4", ""),
+                drive_link,
+                direct_link,
+                campaign_name,
+                adset_name,
+                p_data["primary_text"],
+                p_data["headline_meta"],
+                prompt_text,
+            ],
+            value_input_option="USER_ENTERED"
+        )
+
+        # 6) Mark prompt done
+        mark_prompt_done(gc, c_cfg, row_index)
+        print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
+        return True
+
+    except Exception as e:
+        print(f"  [{c_name}] ERROR editing V{vid_index}: {e}")
+        send_telegram(f"[{c_name}] Error editing V{vid_index} (row {row_index}): {str(e)[:150]}")
+        return False
+
+    finally:
+        for tmp in [local_hook_raw]:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except:
+                pass
+        if local_edited:
+            try:
+                if os.path.exists(local_edited):
+                    os.remove(local_edited)
+            except:
+                pass
+
+
 def generate_and_process(country=None):
     """
-    Full pipeline per country:
+    Parallel pipeline per country:
     1. Read prompts from sheet
-    2. Generate video via kie.ai
-    3. Upload original to RESULTS/<country>/<date>/original/
-    4. Edit (re-encode, cut, concat Part2, subtitles, title)
-    5. Upload edited to RESULTS/<country>/<date>/edited/
-    6. Log in Master Sheet
-    7. Mark prompt done
+    2. Fire ALL kie.ai generation requests at once
+    3. Poll all tasks every 15s
+    4. As soon as a video is ready, download + edit + upload immediately
+    5. Continue polling remaining tasks
     """
     global is_generating
-    now = datetime.datetime.now()
-    date_du_jour = now.strftime("%d.%m")
+    date_du_jour = datetime.datetime.now().strftime("%d.%m")
 
     countries_to_process = {}
     if country:
@@ -606,7 +688,7 @@ def generate_and_process(country=None):
 
         for c_name, c_cfg in countries_to_process.items():
             print(f"\n{'='*50}")
-            print(f"GENERATE + EDIT: {c_name}")
+            print(f"PARALLEL GENERATE + EDIT: {c_name}")
             print(f"{'='*50}")
 
             prompts = get_prompts_for_country(gc, c_cfg)
@@ -614,17 +696,17 @@ def generate_and_process(country=None):
                 print(f"[{c_name}] No pending prompts")
                 continue
 
-            send_telegram(f"[{c_name}] Pipeline started: {len(prompts)} video(s)")
+            send_telegram(f"[{c_name}] Pipeline started: {len(prompts)} video(s) (parallel)")
 
             results_folder_id = c_cfg["results_folder_id"]
             part2_file_id = c_cfg["part2_file_id"]
 
-            # Prepare Drive folders for today
+            # Prepare Drive folders
             today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
             edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
             original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
 
-            # Download and re-encode Part2 once per country
+            # Download and re-encode Part2 once
             local_part2       = f"/tmp/part2_{c_name}.mp4"
             local_part2_clean = f"/tmp/part2_clean_{c_name}.mp4"
             for p in [local_part2, local_part2_clean]:
@@ -632,7 +714,7 @@ def generate_and_process(country=None):
                     os.remove(p)
             drive_download_file(drive_service, part2_file_id, local_part2)
             reencode_video(local_part2, local_part2_clean)
-            print(f"  [{c_name}] Part2 downloaded and re-encoded")
+            print(f"  [{c_name}] Part2 ready")
 
             # Video numbering
             master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
@@ -641,89 +723,102 @@ def generate_and_process(country=None):
             existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
             vid_index = existing_today + 1
 
-            for i, p_data in enumerate(prompts, 1):
-                prompt_text = p_data["prompt"]
-                row_index = p_data["row_index"]
-                nom_final = f"{date_du_jour}_V{vid_index}.mp4"
-
-                print(f"\n--- [{c_name}] Video {i}/{len(prompts)} (row {row_index}) ---")
-                print(f"  Prompt: {prompt_text[:100]}...")
-
-                local_hook_raw = f"/tmp/hook_raw_{c_name}_{vid_index}.mp4"
-                local_edited = None
-
+            # ── STEP 1: Fire ALL generation requests at once ──
+            tasks = []
+            for p_data in prompts:
                 try:
-                    # 1) Generate via kie.ai
-                    task_id = kie_generate_video(prompt_text)
-                    video_url = kie_poll_video(task_id)
-                    kie_download_video(video_url, local_hook_raw)
-
-                    # 2) Upload original to RESULTS/<country>/<date>/original/
-                    orig_filename = f"veo_{now.strftime('%H%M%S')}_{os.urandom(3).hex()}.mp4"
-                    drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
-                    print(f"  [{c_name}] Original uploaded: {orig_filename}")
-
-                    # 3) Edit (inline FFmpeg pipeline)
-                    metadata = {
-                        "title": p_data["title_of_video"] or DEFAULT_TITLE,
-                        "headline": p_data["headline_meta"],
-                        "primary_text": p_data["primary_text"],
-                        "prompt": prompt_text,
-                    }
-                    local_edited = edit_single_video(
-                        local_hook_raw, local_part2_clean, metadata, c_name, vid_index
-                    )
-
-                    # 4) Upload edited to RESULTS/<country>/<date>/edited/
-                    out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
-                    print(f"  [{c_name}] Edited uploaded: {nom_final}")
-
-                    # 5) Log in Master Sheet
-                    version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-                    campaign_name = f"C{date_du_jour}_{c_name}_{version:02d}"
-                    adset_name    = f"adset{version}_{c_name}_{date_du_jour}"
-                    drive_link, direct_link = make_drive_links(out_id)
-                    master_ws.append_row(
-                        [
-                            nom_final.replace(".mp4", ""),
-                            drive_link,
-                            direct_link,
-                            campaign_name,
-                            adset_name,
-                            p_data["primary_text"],
-                            p_data["headline_meta"],
-                            prompt_text,
-                        ],
-                        value_input_option="USER_ENTERED"
-                    )
-
-                    # 6) Mark prompt done
-                    mark_prompt_done(gc, c_cfg, row_index)
-                    print(f"  [{c_name}] Row {row_index} marked done")
-
-                    total_success += 1
+                    task_id = kie_generate_video(p_data["prompt"])
+                    tasks.append({
+                        "task_id": task_id,
+                        "prompt_data": p_data,
+                        "vid_index": vid_index,
+                        "status": "generating",
+                        "video_url": None,
+                        "elapsed": 0,
+                    })
                     vid_index += 1
-
                 except Exception as e:
                     total_errors += 1
-                    print(f"  [{c_name}] ERROR: {e}")
-                    send_telegram(f"[{c_name}] Error row {row_index}: {str(e)[:150]}")
+                    print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
+                    send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
 
-                finally:
-                    for tmp in [local_hook_raw]:
-                        try:
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                        except:
-                            pass
-                    if local_edited:
-                        try:
-                            if os.path.exists(local_edited):
-                                os.remove(local_edited)
-                        except:
-                            pass
+            if not tasks:
+                continue
 
-            # Cleanup Part2 temp files
+            print(f"  [{c_name}] {len(tasks)} generation(s) submitted in parallel")
+
+            # ── STEP 2: Poll loop — check all pending, edit as soon as ready ──
+            max_wait = 600
+            interval = 15
+
+            while any(t["status"] == "generating" for t in tasks):
+                time.sleep(interval)
+
+                for task in tasks:
+                    if task["status"] != "generating":
+                        continue
+
+                    task["elapsed"] += interval
+                    task_id = task["task_id"]
+
+                    try:
+                        resp = http_requests.get(
+                            f"{KIE_API_BASE}/api/v1/veo/record-info",
+                            headers=KIE_HEADERS,
+                            params={"taskId": task_id},
+                            timeout=30,
+                        )
+                        data = resp.json()
+                        if data.get("code") != 200:
+                            print(f"  kie.ai poll error for {task_id}: {data.get('msg', '')}")
+                            continue
+
+                        flag = data["data"].get("successFlag", 0)
+
+                        if flag == 1:
+                            urls = data["data"].get("response", {}).get("resultUrls", [])
+                            if not urls:
+                                task["status"] = "failed"
+                                total_errors += 1
+                                print(f"  [{c_name}] V{task['vid_index']}: success but no URL")
+                                continue
+
+                            task["video_url"] = urls[0]
+                            task["status"] = "ready"
+                            print(f"  [{c_name}] V{task['vid_index']} ready! Editing now...")
+
+                            ok = process_ready_video(
+                                task, drive_service, gc, c_name, c_cfg,
+                                local_part2_clean, edited_folder_id, original_folder_id,
+                                master_ws, date_du_jour,
+                            )
+                            task["status"] = "done" if ok else "failed"
+                            if ok:
+                                total_success += 1
+                            else:
+                                total_errors += 1
+
+                        elif flag in (2, 3):
+                            err = data["data"].get("errorMessage", "unknown")
+                            task["status"] = "failed"
+                            total_errors += 1
+                            print(f"  [{c_name}] V{task['vid_index']} generation failed: {err}")
+                            send_telegram(f"[{c_name}] V{task['vid_index']} failed: {err[:100]}")
+
+                    except Exception as e:
+                        print(f"  [{c_name}] Poll error V{task['vid_index']}: {e}")
+
+                    if task["status"] == "generating" and task["elapsed"] >= max_wait:
+                        task["status"] = "failed"
+                        total_errors += 1
+                        print(f"  [{c_name}] V{task['vid_index']} timed out after {max_wait}s")
+                        send_telegram(f"[{c_name}] V{task['vid_index']} timed out")
+
+                pending = sum(1 for t in tasks if t["status"] == "generating")
+                if pending > 0:
+                    print(f"  [{c_name}] {pending} still generating...")
+
+            # Cleanup Part2
             for p in [local_part2, local_part2_clean]:
                 try:
                     if os.path.exists(p):

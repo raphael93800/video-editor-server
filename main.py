@@ -2,7 +2,6 @@ import os
 import io
 import datetime
 import subprocess
-import threading
 import time
 import openai
 import gspread
@@ -18,11 +17,9 @@ import base64
 app = FastAPI()
 
 # ============================================================
-# CONFIGURATION (via variables d'environnement sur Render)
+# CONFIGURATION
 # ============================================================
 MASTER_SHEET_URL    = os.environ.get("MASTER_SHEET_URL",    "https://docs.google.com/spreadsheets/d/1tlB7auPNU_fXUiuIbI-5EbmizInw4rw35tB2SWEvPas/edit")
-HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "1xBxtWYJl-N0ydQtms6xxf7OZHlMpCjid")
-RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1nqgRKZbsdCykGRyuJjFJD5cp_AejFhlC")
 PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
 PART2_UK_FILE_ID    = os.environ.get("PART2_UK_FILE_ID",    "1_G7pAuZx-5-xCFEsurI5CXiQVQfM2Csu")
 DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no one told you about")
@@ -38,29 +35,21 @@ KIE_API_BASE        = "https://api.kie.ai"
 KIE_MODEL           = os.environ.get("KIE_MODEL",           "veo3_fast")
 KIE_ASPECT_RATIO    = "9:16"
 
-# Prompt sheet (Videos IA n8n)
+# Prompt sheet
 PROMPTS_SHEET_ID    = os.environ.get("PROMPTS_SHEET_ID",    "13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g")
 MAX_VIDEOS_PER_RUN  = int(os.environ.get("MAX_VIDEOS_PER_RUN", "5"))
 
 # ============================================================
 # MULTI-COUNTRY CONFIG
 # ============================================================
-# Each country has its own HOOKS subfolder, RESULTS subfolder,
-# Part2 video, and Master Sheet tab.
-# Subfolder IDs can be set via env vars, or will be auto-created
-# inside the parent HOOK / RESULTS folders with the correct names.
-# Drive folder names: "HOOKS/USA", "HOOKS/UK" inside HOOK parent,
-#                     "RESULTS/USA", "RESULTS/UK" inside RESULTS parent.
 COUNTRY_CONFIG = {
     "USA": {
-        "hooks_folder_id":   os.environ.get("HOOKS_USA_FOLDER_ID", "12KQp_2d0witKtbASqM2caLW8zCfdIz00"),
         "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ"),
         "part2_file_id":     PART2_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_USA", "To launch (USA)"),
         "prompt_tab":        os.environ.get("PROMPT_TAB_USA", "USA"),
     },
     "UK": {
-        "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", "1y7-L9PpZmEBzAFVCAHfNX5pMQaExiIOV"),
         "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", "1SeDVgbd1Fo3SyYdxRbmP4QeIpuqyAoni"),
         "part2_file_id":     PART2_UK_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_UK", "To launch (UK)"),
@@ -75,8 +64,7 @@ MASTER_SHEET_HEADERS = [
 
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
-processing_lock = threading.Lock()
-is_processing = False
+is_generating = False
 
 # ============================================================
 # GOOGLE AUTH
@@ -95,76 +83,8 @@ def get_google_services():
     return drive_service, gc
 
 # ============================================================
-# FONCTIONS DRIVE
+# DRIVE HELPERS
 # ============================================================
-def drive_list_all_files(drive_service, folder_id):
-    """Liste tous les fichiers dans un dossier (vidéos ET .txt)."""
-    q = f"'{folder_id}' in parents and trashed = false"
-    out = []
-    page_token = None
-    while True:
-        resp = drive_service.files().list(
-            q=q, fields="nextPageToken, files(id, name)",
-            pageToken=page_token, pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
-        out.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return out
-
-def drive_list_videos(drive_service, folder_id):
-    """Liste uniquement les fichiers vidéo (.mp4, .mov)."""
-    all_files = drive_list_all_files(drive_service, folder_id)
-    videos = [f for f in all_files if f["name"].lower().strip().endswith((".mp4", ".mov"))]
-    videos.sort(key=lambda x: x["name"].lower())
-    return videos
-
-def drive_find_txt_for_hook(drive_service, folder_id, hook_name):
-    """
-    Cherche le fichier .txt qui correspond au hook.
-    n8n crée veo_HHMMSS_xxx.mp4 ET veo_HHMMSS_xxx.txt dans le même dossier.
-    """
-    stem = os.path.splitext(hook_name)[0]
-    txt_name = stem + ".txt"
-    all_files = drive_list_all_files(drive_service, folder_id)
-    for f in all_files:
-        if f["name"] == txt_name:
-            return f["id"]
-    return None
-
-def drive_read_txt_metadata(drive_service, file_id):
-    """
-    Télécharge et parse le fichier .txt JSON créé par n8n.
-    Format attendu :
-    {
-      "video_title": "...",
-      "primary_text": "...",
-      "headline": "...",
-      "video_prompt": "..."
-    }
-    """
-    try:
-        request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        content = buf.getvalue().decode("utf-8")
-        data = json.loads(content)
-        return {
-            "title":        data.get("video_title", "").strip(),
-            "headline":     data.get("headline", "").strip(),
-            "primary_text": data.get("primary_text", "").strip(),
-            "video_prompt": data.get("video_prompt", "").strip(),
-        }
-    except Exception as e:
-        print(f"⚠️ Impossible de lire le .txt metadata: {e}")
-        return None
-
 def drive_download_file(drive_service, file_id, local_path):
     request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.FileIO(local_path, "wb")
@@ -187,25 +107,6 @@ def drive_get_or_create_folder(drive_service, parent_id, folder_name):
     created = drive_service.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     return created["id"]
 
-def drive_move_file(drive_service, file_id, new_parent_id):
-    file_meta = drive_service.files().get(
-        fileId=file_id, fields="parents", supportsAllDrives=True
-    ).execute()
-    old_parents = ",".join(file_meta.get("parents", []))
-    drive_service.files().update(
-        fileId=file_id,
-        addParents=new_parent_id,
-        removeParents=old_parents,
-        supportsAllDrives=True
-    ).execute()
-
-def drive_delete_file(drive_service, file_id):
-    """Supprime un fichier de Drive (pour nettoyer les .txt après traitement)."""
-    try:
-        drive_service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
-    except Exception as e:
-        print(f"⚠️ Impossible de supprimer le fichier Drive: {e}")
-
 def drive_upload_video(drive_service, local_path, parent_id, filename):
     media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True)
     meta = {"name": filename, "parents": [parent_id]}
@@ -220,29 +121,16 @@ def make_drive_links(file_id):
     return share_link, direct_download
 
 # ============================================================
-# MULTI-COUNTRY : auto-create subfolders and resolve IDs
-# ============================================================
-def log_country_folders():
-    """Log the folder IDs being used for each country."""
-    for country, cfg in COUNTRY_CONFIG.items():
-        print(f"📁 HOOKS/{country} → {cfg['hooks_folder_id']}")
-        print(f"📁 RESULTS/{country} → {cfg['results_folder_id']}")
-
-# ============================================================
-# MASTER SHEET : get or create tab per country
+# MASTER SHEET
 # ============================================================
 def get_or_create_master_tab(gc, tab_name):
-    """
-    Opens the Master Sheet and returns the worksheet for the given tab.
-    Creates the tab with headers if it doesn't exist.
-    """
     spreadsheet = gc.open_by_url(MASTER_SHEET_URL)
     try:
         ws = spreadsheet.worksheet(tab_name)
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=tab_name, rows=1000, cols=20)
         ws.append_row(MASTER_SHEET_HEADERS, value_input_option="USER_ENTERED")
-        print(f"📋 Onglet '{tab_name}' créé dans le Master Sheet")
+        print(f"  Tab '{tab_name}' created in Master Sheet")
     return ws
 
 # ============================================================
@@ -256,12 +144,12 @@ def send_telegram(msg):
             timeout=10
         )
         if not resp.ok:
-            print(f"⚠️ Telegram error: {resp.status_code} — {resp.text[:200]}")
+            print(f"  Telegram error: {resp.status_code} — {resp.text[:200]}")
     except Exception as e:
-        print(f"⚠️ Telegram send failed: {e}")
+        print(f"  Telegram send failed: {e}")
 
 # ============================================================
-# FFMPEG : obtenir la durée d'une vidéo
+# FFMPEG HELPERS
 # ============================================================
 def get_video_duration(path):
     result = subprocess.run(
@@ -271,9 +159,6 @@ def get_video_duration(path):
     )
     return float(result.stdout.strip())
 
-# ============================================================
-# FFMPEG : vérifier si une vidéo a une piste vidéo
-# ============================================================
 def has_video_stream(path):
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -283,9 +168,6 @@ def has_video_stream(path):
     )
     return "video" in result.stdout.strip()
 
-# ============================================================
-# FFMPEG : ré-encoder proprement une vidéo (fix keyframes)
-# ============================================================
 def reencode_video(input_path, output_path):
     subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
@@ -296,9 +178,6 @@ def reencode_video(input_path, output_path):
         output_path
     ], check=True, capture_output=True)
 
-# ============================================================
-# FFMPEG : détecter start/end de la parole via Whisper
-# ============================================================
 def get_speech_bounds(audio_path, video_duration):
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     with open(audio_path, "rb") as f:
@@ -314,11 +193,8 @@ def get_speech_bounds(audio_path, video_duration):
         end_t = min(words[-1].end + 0.8, video_duration - 0.05)
     else:
         start_t, end_t = 0, video_duration
-    return start_t, end_t, result
+    return start_t, end_t
 
-# ============================================================
-# FFMPEG : générer les sous-titres au format SRT
-# ============================================================
 def generate_srt(audio_path):
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     with open(audio_path, "rb") as f:
@@ -356,9 +232,6 @@ def generate_srt(audio_path):
 
     return "\n".join(srt_lines)
 
-# ============================================================
-# Construire les filtres drawtext pour les sous-titres
-# ============================================================
 def build_subtitle_drawtext_filters(srt_path, font_path):
     import re as _re
 
@@ -415,69 +288,48 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
     return filters
 
 # ============================================================
-# MONTAGE D'UN SEUL HOOK (fonction réutilisable)
+# EDIT A SINGLE VIDEO (local file + in-memory metadata)
 # ============================================================
-def process_single_hook(drive_service, master_ws, hook_file, global_index,
-                        date_du_jour, edited_folder_id, original_folder_id,
-                        local_part2_clean, hooks_folder_id, country):
+def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_index):
     """
-    Monte une seule vidéo hook + Part2.
-    Lit les métadonnées depuis le fichier .txt créé par n8n dans le dossier HOOKS/<country>.
-    Retourne True si succès, False si erreur.
+    Full FFmpeg editing pipeline on a local video file.
+    Returns path to the edited output file, or raises on error.
+    metadata: dict with keys title, headline, primary_text, prompt
     """
-    hook_id   = hook_file["id"]
-    hook_name = hook_file["name"]
-    nom_final = f"{date_du_jour}_V{global_index}.mp4"
+    pfx = f"/tmp/edit_{country}_{vid_index}"
+    local_hook_clean = f"{pfx}_clean.mp4"
+    local_hook_audio = f"{pfx}_audio.wav"
+    local_hook_cut   = f"{pfx}_cut.mp4"
+    local_concat     = f"{pfx}_concat.mp4"
+    local_audio      = f"{pfx}_full_audio.wav"
+    local_srt        = f"{pfx}_subs.srt"
+    local_out        = f"{pfx}_final.mp4"
+    concat_list      = f"{pfx}_list.txt"
 
-    local_hook       = f"/tmp/hook_{country}_{global_index}.mp4"
-    local_hook_clean = f"/tmp/hook_clean_{country}_{global_index}.mp4"
-    local_hook_audio = f"/tmp/hook_audio_{country}_{global_index}.wav"
-    local_hook_cut   = f"/tmp/hook_cut_{country}_{global_index}.mp4"
-    local_concat     = f"/tmp/concat_{country}_{global_index}.mp4"
-    local_audio      = f"/tmp/audio_{country}_{global_index}.wav"
-    local_srt        = f"/tmp/subs_{country}_{global_index}.srt"
-    local_out        = f"/tmp/out_{country}_{global_index}.mp4"
-    concat_list      = f"/tmp/list_{country}_{global_index}.txt"
+    temps = [local_hook_clean, local_hook_audio, local_hook_cut,
+             local_concat, local_audio, local_srt, concat_list]
 
     try:
-        # ── 1. Lire les métadonnées depuis le fichier .txt ──────────────────
-        txt_file_id = drive_find_txt_for_hook(drive_service, hooks_folder_id, hook_name)
-        if txt_file_id:
-            meta = drive_read_txt_metadata(drive_service, txt_file_id)
-            if meta:
-                video_title    = meta["title"] or DEFAULT_TITLE
-                video_headline = meta["headline"]
-                video_primary  = meta["primary_text"]
-                video_prompt   = meta["video_prompt"]
-                print(f"📄 [{country}] Métadonnées lues depuis .txt: titre='{video_title}'")
-            else:
-                video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
-        else:
-            print(f"⚠️ [{country}] Pas de fichier .txt trouvé pour {hook_name} — valeurs par défaut")
-            video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
+        video_title   = metadata.get("title", "") or DEFAULT_TITLE
+        video_prompt  = metadata.get("prompt", "")
 
-        # ── 2. Télécharger et ré-encoder le hook ────────────────────────────
-        drive_download_file(drive_service, hook_id, local_hook)
-        print(f"📥 [{country}] Hook téléchargé: {hook_name}")
-        reencode_video(local_hook, local_hook_clean)
-        print(f"🔄 [{country}] Hook ré-encodé")
-
+        # 1. Re-encode hook
+        reencode_video(local_hook_raw, local_hook_clean)
         if not has_video_stream(local_hook_clean):
-            raise Exception(f"Pas de piste vidéo dans {hook_name} après ré-encodage")
-
+            raise Exception("No video stream after re-encoding")
         hook_duration = get_video_duration(local_hook_clean)
-        print(f"⏱ [{country}] Durée hook: {hook_duration:.2f}s")
+        print(f"  [{country}] Hook re-encoded: {hook_duration:.2f}s")
 
-        # ── 3. Détecter les bornes de parole ────────────────────────────────
+        # 2. Speech detection
         subprocess.run([
             "ffmpeg", "-y", "-i", local_hook_clean,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             local_hook_audio
         ], check=True, capture_output=True)
-        start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
-        print(f"🎤 [{country}] Parole: {start_t:.2f}s → {end_t:.2f}s")
+        start_t, end_t = get_speech_bounds(local_hook_audio, hook_duration)
+        print(f"  [{country}] Speech: {start_t:.2f}s -> {end_t:.2f}s")
 
-        # ── 4. Couper le hook ───────────────────────────────────────────────
+        # 3. Cut hook to speech bounds
         subprocess.run([
             "ffmpeg", "-y", "-i", local_hook_clean,
             "-ss", str(start_t), "-to", str(end_t),
@@ -485,12 +337,10 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             "-c:a", "aac", "-ar", "44100",
             local_hook_cut
         ], check=True, capture_output=True)
-        print(f"✂️ [{country}] Hook coupé")
-
         if not has_video_stream(local_hook_cut):
-            raise Exception("Hook coupé sans piste vidéo")
+            raise Exception("No video stream after cutting")
 
-        # ── 5. Concaténer hook + Part2 ──────────────────────────────────────
+        # 4. Concat hook + Part2
         with open(concat_list, "w") as cl:
             cl.write(f"file '{local_hook_cut}'\n")
             cl.write(f"file '{local_part2_clean}'\n")
@@ -502,25 +352,22 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             "-movflags", "+faststart",
             local_concat
         ], check=True, capture_output=True)
-        print(f"🔗 [{country}] Concaténation OK")
-
         if not has_video_stream(local_concat):
-            raise Exception("Vidéo concaténée sans piste vidéo")
+            raise Exception("No video stream after concat")
 
-        # ── 6. Extraire l'audio pour Whisper ────────────────────────────────
+        # 5. Extract full audio for subtitles
         subprocess.run([
             "ffmpeg", "-y", "-i", local_concat,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             local_audio
         ], check=True, capture_output=True)
 
-        # ── 7. Générer les sous-titres SRT ──────────────────────────────────
+        # 6. Generate SRT subtitles
         srt_content = generate_srt(local_audio)
         with open(local_srt, "w", encoding="utf-8") as sf:
             sf.write(srt_content)
-        print(f"📝 [{country}] Sous-titres générés")
 
-        # ── 8. Construire le filtre titre ───────────────────────────────────
+        # 7. Build title filter
         title_clean = video_title.replace("\n", " ").strip()
         words_t = title_clean.split()
         line1, line2 = "", ""
@@ -560,7 +407,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
                 f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
             )
 
-        # ── 9. Brûler titre + sous-titres ───────────────────────────────────
+        # 8. Burn title + subtitles
         sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
         all_filters = [title_filter] + sub_filters
         vf_filter = ",".join(all_filters)
@@ -575,294 +422,24 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
         ], capture_output=True, text=True)
 
         if result.returncode != 0:
-            print(f"⚠️ [{country}] Erreur overlay: {result.stderr[-500:]}")
+            print(f"  [{country}] Overlay error, using concat as fallback: {result.stderr[-300:]}")
             import shutil
             shutil.copy(local_concat, local_out)
 
         if not has_video_stream(local_out):
-            raise Exception("Fichier final sans piste vidéo")
+            raise Exception("No video stream in final output")
 
         final_duration = get_video_duration(local_out)
-        print(f"✅ [{country}] Vidéo finale: {final_duration:.2f}s")
-
-        # ── 10. Upload vers Drive ────────────────────────────────────────────
-        out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
-
-        # Move original hook from HOOKS/<country> to original/ folder
-        try:
-            drive_move_file(drive_service, hook_id, original_folder_id)
-            print(f"📦 [{country}] Hook déplacé vers original/")
-        except Exception as move_err:
-            print(f"⚠️ [{country}] Erreur move, suppression du hook: {move_err}")
-            drive_delete_file(drive_service, hook_id)
-
-        if txt_file_id:
-            drive_delete_file(drive_service, txt_file_id)
-
-        # ── 11. Log dans le Master Sheet ────────────────────────────────────
-        version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-        campaign_name = f"C{date_du_jour}_{country}_{version:02d}"
-        adset_name    = f"adset{version}_{country}_{date_du_jour}"
-        drive_link, direct_link = make_drive_links(out_id)
-        master_ws.append_row(
-            [
-                nom_final.replace(".mp4", ""),  # Ad_Name
-                drive_link,                      # Drive_Share_Link
-                direct_link,                     # Direct_Download_Link
-                campaign_name,                   # Campaign_Name
-                adset_name,                      # AdSet_Name
-                video_primary,                   # Primary_Text
-                video_headline,                  # Headline
-                video_prompt,                    # Video_Prompt
-            ],
-            value_input_option="USER_ENTERED"
-        )
-        print(f"✅ [{country}] {nom_final} monté et uploadé avec succès")
-        return True
-
-    except Exception as e:
-        print(f"❌ [{country}] Erreur sur {hook_name}: {e}")
-        send_telegram(f"⚠️ [{country}] Erreur sur {hook_name}: {str(e)[:150]}")
-        return False
+        print(f"  [{country}] Edited video: {final_duration:.2f}s")
+        return local_out
 
     finally:
-        for path in [local_hook, local_hook_clean, local_hook_audio, local_hook_cut,
-                     local_concat, local_audio, local_srt, local_out, concat_list]:
+        for p in temps:
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                if os.path.exists(p):
+                    os.remove(p)
             except:
                 pass
-
-# ============================================================
-# PROCESS ONE COUNTRY — all hooks in its folder
-# ============================================================
-def process_country(drive_service, gc, country, cfg, date_du_jour):
-    """
-    Process all hooks for a single country.
-    Returns (success_count, error_count).
-    """
-    hooks_folder_id  = cfg["hooks_folder_id"]
-    results_folder_id = cfg["results_folder_id"]
-    part2_file_id    = cfg["part2_file_id"]
-    master_tab       = cfg["master_tab"]
-
-    local_part2       = f"/tmp/partie2_{country}.mp4"
-    local_part2_clean = f"/tmp/partie2_clean_{country}.mp4"
-
-    master_ws = get_or_create_master_tab(gc, master_tab)
-
-    # Prepare results subfolders for today
-    today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
-    edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
-    original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
-
-    # Download and re-encode Part2 once per country
-    for p in [local_part2, local_part2_clean]:
-        if os.path.exists(p):
-            os.remove(p)
-    drive_download_file(drive_service, part2_file_id, local_part2)
-    reencode_video(local_part2, local_part2_clean)
-    print(f"✅ [{country}] Part2 téléchargée et ré-encodée")
-
-    # Video numbering: count existing videos for this country today
-    today_prefix = f"{date_du_jour}_V"
-    existing_rows = master_ws.get_all_values()
-    existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-    global_index = existing_today + 1
-    print(f"📊 [{country}] {existing_today} vidéos aujourd'hui → prochaine: V{global_index}")
-
-    success_count = 0
-    error_count = 0
-    empty_checks = 0
-
-    while True:
-        hook_files = drive_list_videos(drive_service, hooks_folder_id)
-
-        if not hook_files:
-            empty_checks += 1
-            print(f"📭 [{country}] HOOKS vide ({empty_checks}/2)")
-            if empty_checks >= 2:
-                print(f"🏁 [{country}] HOOKS vide 2 fois de suite — terminé")
-                break
-            print(f"⏳ [{country}] Attente 30s avant de revérifier...")
-            time.sleep(30)
-            continue
-
-        empty_checks = 0
-        send_telegram(f"🎬 *[{country}]* — {len(hook_files)} hook(s) à monter (V{global_index}→V{global_index + len(hook_files) - 1})...")
-
-        for hook_file in hook_files:
-            ok = process_single_hook(
-                drive_service=drive_service,
-                master_ws=master_ws,
-                hook_file=hook_file,
-                global_index=global_index,
-                date_du_jour=date_du_jour,
-                edited_folder_id=edited_folder_id,
-                original_folder_id=original_folder_id,
-                local_part2_clean=local_part2_clean,
-                hooks_folder_id=hooks_folder_id,
-                country=country,
-            )
-            if ok:
-                success_count += 1
-            else:
-                error_count += 1
-            global_index += 1
-
-        print(f"⏳ [{country}] Batch terminé — attente 30s avant de revérifier...")
-        time.sleep(30)
-
-    # Cleanup Part2 temp files
-    for p in [local_part2, local_part2_clean]:
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except:
-            pass
-
-    return success_count, error_count
-
-# ============================================================
-# MONTAGE PRINCIPAL — MULTI-COUNTRY
-# ============================================================
-def process_videos(country=None):
-    """
-    Main processing loop.
-    - If country is specified (e.g. "UK"), only process that country's HOOKS folder.
-    - If country is None, process ALL countries sequentially.
-    """
-    global is_processing
-    now = datetime.datetime.now()
-    date_du_jour = now.strftime("%d.%m")
-
-    countries_to_process = {}
-    if country:
-        c = country.upper()
-        if c not in COUNTRY_CONFIG:
-            print(f"❌ Pays inconnu: {c}. Pays disponibles: {list(COUNTRY_CONFIG.keys())}")
-            is_processing = False
-            return
-        countries_to_process = {c: COUNTRY_CONFIG[c]}
-    else:
-        countries_to_process = COUNTRY_CONFIG
-
-    try:
-        drive_service, gc = get_google_services()
-
-        # Ensure HOOKS/<country> and RESULTATS/<country> folders exist
-        log_country_folders()
-
-        total_success = 0
-        total_errors = 0
-
-        for c_name, c_cfg in countries_to_process.items():
-            print(f"\n{'='*50}")
-            print(f"🌍 Traitement: {c_name}")
-            print(f"{'='*50}")
-
-            s, e = process_country(drive_service, gc, c_name, c_cfg, date_du_jour)
-            total_success += s
-            total_errors += e
-
-        # Final report
-        msg = f"🚀 *Video Editor — Mission accomplie!*\n\n"
-        msg += f"🌍 Pays traités: {', '.join(countries_to_process.keys())}\n"
-        msg += f"✅ {total_success} vidéo(s) montée(s) avec succès\n"
-        if total_errors > 0:
-            msg += f"❌ {total_errors} erreur(s)\n"
-        send_telegram(msg)
-
-    except Exception as e:
-        send_telegram(f"❌ *Video Editor — Erreur critique:* {str(e)[:200]}")
-        print(f"Erreur critique: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        is_processing = False
-
-# ============================================================
-# TEST — Monte un seul hook pour vérifier le pipeline
-# ============================================================
-def process_single_test(country="USA"):
-    """Monte uniquement le premier hook trouvé dans HOOKS/<country>, sans boucle."""
-    global is_processing
-    country = country.upper()
-
-    if country not in COUNTRY_CONFIG:
-        print(f"❌ Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}")
-        is_processing = False
-        return
-
-    cfg = COUNTRY_CONFIG[country]
-    now = datetime.datetime.now()
-    date_du_jour = now.strftime("%d.%m")
-    local_part2 = f"/tmp/partie2_{country}.mp4"
-    local_part2_clean = f"/tmp/partie2_clean_{country}.mp4"
-
-    print(f"🧪 TEST — Pays: {country} — Part2 ID: {cfg['part2_file_id']}")
-
-    try:
-        drive_service, gc = get_google_services()
-        log_country_folders()
-
-        hooks_folder_id = cfg["hooks_folder_id"]
-        results_folder_id = cfg["results_folder_id"]
-
-        master_ws = get_or_create_master_tab(gc, cfg["master_tab"])
-
-        today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
-        edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
-        original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
-
-        for p in [local_part2, local_part2_clean]:
-            if os.path.exists(p):
-                os.remove(p)
-        drive_download_file(drive_service, cfg["part2_file_id"], local_part2)
-        reencode_video(local_part2, local_part2_clean)
-        print(f"✅ [{country}] Part2 téléchargée et ré-encodée")
-
-        hook_files = drive_list_videos(drive_service, hooks_folder_id)
-        if not hook_files:
-            msg = f"🧪 TEST [{country}] — Aucun hook trouvé dans HOOKS/{country}"
-            print(msg)
-            send_telegram(msg)
-            return
-
-        today_prefix = f"{date_du_jour}_V"
-        existing_rows = master_ws.get_all_values()
-        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-        global_index = existing_today + 1
-
-        hook_file = hook_files[0]
-        send_telegram(f"🧪 *TEST [{country}]* — Montage de {hook_file['name']}...")
-
-        ok = process_single_hook(
-            drive_service=drive_service,
-            master_ws=master_ws,
-            hook_file=hook_file,
-            global_index=global_index,
-            date_du_jour=date_du_jour,
-            edited_folder_id=edited_folder_id,
-            original_folder_id=original_folder_id,
-            local_part2_clean=local_part2_clean,
-            hooks_folder_id=hooks_folder_id,
-            country=country,
-        )
-
-        if ok:
-            send_telegram(f"🧪✅ *TEST [{country}] réussi* — {hook_file['name']}")
-        else:
-            send_telegram(f"🧪❌ *TEST [{country}] échoué* — {hook_file['name']}")
-
-    except Exception as e:
-        send_telegram(f"🧪❌ *TEST [{country}] — Erreur:* {str(e)[:200]}")
-        print(f"Erreur test: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        is_processing = False
 
 # ============================================================
 # KIE.AI (VEO 3.1) — VIDEO GENERATION API
@@ -873,7 +450,6 @@ KIE_HEADERS = {
 }
 
 def kie_generate_video(prompt: str) -> str:
-    """Submit a text-to-video generation task to kie.ai. Returns taskId."""
     resp = http_requests.post(
         f"{KIE_API_BASE}/api/v1/veo/generate",
         headers=KIE_HEADERS,
@@ -892,13 +468,7 @@ def kie_generate_video(prompt: str) -> str:
     print(f"  kie.ai task created: {task_id}")
     return task_id
 
-
 def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
-    """
-    Poll kie.ai until video is ready.
-    Returns the download URL of the generated video.
-    successFlag: 0=generating, 1=success, 2=failed, 3=generation failed
-    """
     elapsed = 0
     while elapsed < max_wait:
         time.sleep(interval)
@@ -929,16 +499,13 @@ def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
 
     raise Exception(f"kie.ai timeout after {max_wait}s for task {task_id}")
 
-
 def kie_download_video(url: str, local_path: str):
-    """Download generated video from kie.ai URL to local file."""
     resp = http_requests.get(url, stream=True, timeout=120)
     resp.raise_for_status()
     with open(local_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
     print(f"  kie.ai video downloaded: {local_path}")
-
 
 # ============================================================
 # PROMPT SHEET — read prompts per country
@@ -948,11 +515,6 @@ PROMPT_SHEET_HEADERS = [
 ]
 
 def get_prompts_for_country(gc, country_cfg, limit=None):
-    """
-    Read pending prompts from the per-country tab in the prompt sheet.
-    Returns list of dicts with row_index (1-based, header=row 1) and prompt data.
-    Skips rows where STATUS == 'done'.
-    """
     if limit is None:
         limit = MAX_VIDEOS_PER_RUN
 
@@ -999,9 +561,7 @@ def get_prompts_for_country(gc, country_cfg, limit=None):
 
     return prompts
 
-
 def mark_prompt_done(gc, country_cfg, row_index):
-    """Mark a prompt row as 'done' in the prompt sheet."""
     prompt_tab = country_cfg["prompt_tab"]
     spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
     ws = spreadsheet.worksheet(prompt_tab)
@@ -1010,16 +570,19 @@ def mark_prompt_done(gc, country_cfg, row_index):
         col = headers.index("status") + 1
         ws.update_cell(row_index, col, "done")
 
-
 # ============================================================
-# GENERATE + PROCESS PIPELINE
+# GENERATE + EDIT PIPELINE (all-in-one)
 # ============================================================
-is_generating = False
-
 def generate_and_process(country=None):
     """
-    Full pipeline: read prompts -> generate videos via kie.ai ->
-    upload to HOOKS folder (with .txt metadata) -> trigger editing.
+    Full pipeline per country:
+    1. Read prompts from sheet
+    2. Generate video via kie.ai
+    3. Upload original to RESULTS/<country>/<date>/original/
+    4. Edit (re-encode, cut, concat Part2, subtitles, title)
+    5. Upload edited to RESULTS/<country>/<date>/edited/
+    6. Log in Master Sheet
+    7. Mark prompt done
     """
     global is_generating
     now = datetime.datetime.now()
@@ -1029,7 +592,7 @@ def generate_and_process(country=None):
     if country:
         c = country.upper()
         if c not in COUNTRY_CONFIG:
-            print(f"Pays inconnu: {c}. Disponibles: {list(COUNTRY_CONFIG.keys())}")
+            print(f"Unknown country: {c}. Available: {list(COUNTRY_CONFIG.keys())}")
             is_generating = False
             return
         countries_to_process = {c: COUNTRY_CONFIG[c]}
@@ -1038,114 +601,153 @@ def generate_and_process(country=None):
 
     try:
         drive_service, gc = get_google_services()
-        total_generated = 0
+        total_success = 0
         total_errors = 0
 
         for c_name, c_cfg in countries_to_process.items():
             print(f"\n{'='*50}")
-            print(f"GENERATE: {c_name}")
+            print(f"GENERATE + EDIT: {c_name}")
             print(f"{'='*50}")
 
             prompts = get_prompts_for_country(gc, c_cfg)
             if not prompts:
-                print(f"[{c_name}] Aucun prompt en attente")
+                print(f"[{c_name}] No pending prompts")
                 continue
 
-            send_telegram(
-                f"[{c_name}] Generation demarree: {len(prompts)} video(s) a generer"
-            )
+            send_telegram(f"[{c_name}] Pipeline started: {len(prompts)} video(s)")
 
-            hooks_folder_id = c_cfg["hooks_folder_id"]
+            results_folder_id = c_cfg["results_folder_id"]
+            part2_file_id = c_cfg["part2_file_id"]
+
+            # Prepare Drive folders for today
+            today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
+            edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
+            original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
+
+            # Download and re-encode Part2 once per country
+            local_part2       = f"/tmp/part2_{c_name}.mp4"
+            local_part2_clean = f"/tmp/part2_clean_{c_name}.mp4"
+            for p in [local_part2, local_part2_clean]:
+                if os.path.exists(p):
+                    os.remove(p)
+            drive_download_file(drive_service, part2_file_id, local_part2)
+            reencode_video(local_part2, local_part2_clean)
+            print(f"  [{c_name}] Part2 downloaded and re-encoded")
+
+            # Video numbering
+            master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+            today_prefix = f"{date_du_jour}_V"
+            existing_rows = master_ws.get_all_values()
+            existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+            vid_index = existing_today + 1
 
             for i, p_data in enumerate(prompts, 1):
                 prompt_text = p_data["prompt"]
                 row_index = p_data["row_index"]
+                nom_final = f"{date_du_jour}_V{vid_index}.mp4"
+
                 print(f"\n--- [{c_name}] Video {i}/{len(prompts)} (row {row_index}) ---")
                 print(f"  Prompt: {prompt_text[:100]}...")
 
+                local_hook_raw = f"/tmp/hook_raw_{c_name}_{vid_index}.mp4"
+                local_edited = None
+
                 try:
-                    # 1) Generate video via kie.ai
+                    # 1) Generate via kie.ai
                     task_id = kie_generate_video(prompt_text)
-
-                    # 2) Poll until ready
                     video_url = kie_poll_video(task_id)
+                    kie_download_video(video_url, local_hook_raw)
 
-                    # 3) Download to temp file
-                    time_str = now.strftime("%H%M%S")
-                    rand_suffix = os.urandom(3).hex()
-                    file_stem = f"veo_{time_str}_{rand_suffix}"
-                    local_video = f"/tmp/{file_stem}.mp4"
-                    kie_download_video(video_url, local_video)
+                    # 2) Upload original to RESULTS/<country>/<date>/original/
+                    orig_filename = f"veo_{now.strftime('%H%M%S')}_{os.urandom(3).hex()}.mp4"
+                    drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
+                    print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
-                    # 4) Upload video to HOOKS/<country>
-                    video_filename = f"{file_stem}.mp4"
-                    drive_upload_video(drive_service, local_video, hooks_folder_id, video_filename)
-                    print(f"  Uploaded {video_filename} to HOOKS/{c_name}")
-
-                    # 5) Create .txt metadata file in HOOKS/<country>
-                    meta_content = json.dumps({
-                        "video_title": p_data["title_of_video"] or DEFAULT_TITLE,
-                        "primary_text": p_data["primary_text"],
+                    # 3) Edit (inline FFmpeg pipeline)
+                    metadata = {
+                        "title": p_data["title_of_video"] or DEFAULT_TITLE,
                         "headline": p_data["headline_meta"],
-                        "video_prompt": prompt_text,
-                    }, ensure_ascii=False)
-                    txt_filename = f"{file_stem}.txt"
-                    txt_local = f"/tmp/{file_stem}.txt"
-                    with open(txt_local, "w", encoding="utf-8") as f:
-                        f.write(meta_content)
-                    media = MediaFileUpload(txt_local, mimetype="text/plain")
-                    drive_service.files().create(
-                        body={"name": txt_filename, "parents": [hooks_folder_id]},
-                        media_body=media,
-                        fields="id",
-                        supportsAllDrives=True,
-                    ).execute()
-                    print(f"  Uploaded {txt_filename} to HOOKS/{c_name}")
+                        "primary_text": p_data["primary_text"],
+                        "prompt": prompt_text,
+                    }
+                    local_edited = edit_single_video(
+                        local_hook_raw, local_part2_clean, metadata, c_name, vid_index
+                    )
 
-                    # 6) Mark prompt as done
+                    # 4) Upload edited to RESULTS/<country>/<date>/edited/
+                    out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
+                    print(f"  [{c_name}] Edited uploaded: {nom_final}")
+
+                    # 5) Log in Master Sheet
+                    version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+                    campaign_name = f"C{date_du_jour}_{c_name}_{version:02d}"
+                    adset_name    = f"adset{version}_{c_name}_{date_du_jour}"
+                    drive_link, direct_link = make_drive_links(out_id)
+                    master_ws.append_row(
+                        [
+                            nom_final.replace(".mp4", ""),
+                            drive_link,
+                            direct_link,
+                            campaign_name,
+                            adset_name,
+                            p_data["primary_text"],
+                            p_data["headline_meta"],
+                            prompt_text,
+                        ],
+                        value_input_option="USER_ENTERED"
+                    )
+
+                    # 6) Mark prompt done
                     mark_prompt_done(gc, c_cfg, row_index)
-                    print(f"  Row {row_index} marked as done")
+                    print(f"  [{c_name}] Row {row_index} marked done")
 
-                    total_generated += 1
-
-                    # Cleanup temp files
-                    for tmp in [local_video, txt_local]:
-                        try:
-                            os.remove(tmp)
-                        except:
-                            pass
+                    total_success += 1
+                    vid_index += 1
 
                 except Exception as e:
                     total_errors += 1
-                    print(f"  ERREUR: {e}")
-                    send_telegram(
-                        f"[{c_name}] Erreur generation row {row_index}: {str(e)[:150]}"
-                    )
+                    print(f"  [{c_name}] ERROR: {e}")
+                    send_telegram(f"[{c_name}] Error row {row_index}: {str(e)[:150]}")
 
-        # All countries done generating — now trigger editing
+                finally:
+                    for tmp in [local_hook_raw]:
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except:
+                            pass
+                    if local_edited:
+                        try:
+                            if os.path.exists(local_edited):
+                                os.remove(local_edited)
+                        except:
+                            pass
+
+            # Cleanup Part2 temp files
+            for p in [local_part2, local_part2_clean]:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except:
+                    pass
+
+        # Final report
         msg = (
-            f"Generation terminee!\n\n"
-            f"Pays: {', '.join(countries_to_process.keys())}\n"
-            f"{total_generated} video(s) generee(s)\n"
+            f"Pipeline complete!\n\n"
+            f"Countries: {', '.join(countries_to_process.keys())}\n"
+            f"{total_success} video(s) generated + edited\n"
         )
         if total_errors:
-            msg += f"{total_errors} erreur(s)\n"
-
-        if total_generated > 0:
-            msg += "\nLancement du montage..."
-            send_telegram(msg)
-            process_videos(country)
-        else:
-            send_telegram(msg)
+            msg += f"{total_errors} error(s)\n"
+        send_telegram(msg)
 
     except Exception as e:
-        send_telegram(f"Erreur critique generation: {str(e)[:200]}")
-        print(f"Erreur critique: {e}")
+        send_telegram(f"Critical error: {str(e)[:200]}")
+        print(f"Critical error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         is_generating = False
-
 
 # ============================================================
 # ENDPOINTS
@@ -1154,40 +756,13 @@ def generate_and_process(country=None):
 def root():
     return {
         "status": "Video Editor Server running",
-        "processing": is_processing,
         "generating": is_generating,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
 
-@app.post("/process")
-def trigger_processing(background_tasks: BackgroundTasks, country: str = None):
-    """
-    Lance le montage des hooks.
-    - Sans paramètre : traite TOUS les pays (HOOKS/USA, HOOKS/UK, etc.)
-    - Avec country=UK : traite uniquement les hooks UK.
-    Exemple: POST /process?country=UK
-    """
-    global is_processing
-    if is_processing:
-        return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
-    if country and country.upper() not in COUNTRY_CONFIG:
-        return JSONResponse(
-            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
-            status_code=400
-        )
-    is_processing = True
-    background_tasks.add_task(process_videos, country)
-    target = country.upper() if country else "ALL"
-    return JSONResponse({
-        "status": "started",
-        "country": target,
-        "message": f"Montage démarré en arrière-plan ({target})"
-    })
-
 @app.get("/status")
 def status():
     return {
-        "processing": is_processing,
         "generating": is_generating,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
@@ -1195,19 +770,19 @@ def status():
 @app.post("/generate")
 def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
     """
-    Full pipeline: read prompts from sheet -> generate via kie.ai -> upload to HOOKS -> edit.
-    - Sans parametre : genere pour TOUS les pays.
-    - Avec country=UK : genere uniquement pour UK.
+    Full pipeline: read prompts -> generate via kie.ai -> edit -> upload to RESULTS.
+    - No param: all countries.
+    - country=UK: UK only.
     """
     global is_generating
-    if is_generating or is_processing:
+    if is_generating:
         return JSONResponse({
             "status": "already_running",
-            "message": "Une generation ou un montage est deja en cours",
+            "message": "A generation is already in progress",
         })
     if country and country.upper() not in COUNTRY_CONFIG:
         return JSONResponse(
-            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
+            {"status": "error", "message": f"Unknown country: {country}. Available: {list(COUNTRY_CONFIG.keys())}"},
             status_code=400,
         )
     is_generating = True
@@ -1217,29 +792,7 @@ def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
         "status": "started",
         "country": target,
         "max_videos_per_country": MAX_VIDEOS_PER_RUN,
-        "message": f"Generation + montage demarre en arriere-plan ({target})",
-    })
-
-@app.post("/test")
-def trigger_test(background_tasks: BackgroundTasks, country: str = "USA"):
-    """
-    Monte UNE seule vidéo (la première dans HOOKS/<country>) pour tester.
-    Exemple: POST /test?country=UK
-    """
-    global is_processing
-    if is_processing:
-        return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
-    if country.upper() not in COUNTRY_CONFIG:
-        return JSONResponse(
-            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
-            status_code=400
-        )
-    is_processing = True
-    background_tasks.add_task(process_single_test, country)
-    return JSONResponse({
-        "status": "started",
-        "country": country.upper(),
-        "message": f"Test d'un seul hook lancé (HOOKS/{country.upper()})"
+        "message": f"Generation + editing started ({target})",
     })
 
 if __name__ == "__main__":

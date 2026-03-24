@@ -6,6 +6,7 @@ import threading
 import time
 import openai
 import gspread
+import requests as http_requests
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
@@ -31,6 +32,16 @@ TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
 GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
+# kie.ai (Veo 3.1) video generation
+KIE_API_KEY         = os.environ.get("KIE_API_KEY",         "be30649990b3e9ee1d9644afeeddccf0")
+KIE_API_BASE        = "https://api.kie.ai"
+KIE_MODEL           = os.environ.get("KIE_MODEL",           "veo3_fast")
+KIE_ASPECT_RATIO    = "9:16"
+
+# Prompt sheet (Videos IA n8n)
+PROMPTS_SHEET_ID    = os.environ.get("PROMPTS_SHEET_ID",    "13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g")
+MAX_VIDEOS_PER_RUN  = int(os.environ.get("MAX_VIDEOS_PER_RUN", "5"))
+
 # ============================================================
 # MULTI-COUNTRY CONFIG
 # ============================================================
@@ -46,12 +57,14 @@ COUNTRY_CONFIG = {
         "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ"),
         "part2_file_id":     PART2_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_USA", "To launch (USA)"),
+        "prompt_tab":        os.environ.get("PROMPT_TAB_USA", "USA"),
     },
     "UK": {
         "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", "1y7-L9PpZmEBzAFVCAHfNX5pMQaExiIOV"),
         "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", "1SeDVgbd1Fo3SyYdxRbmP4QeIpuqyAoni"),
         "part2_file_id":     PART2_UK_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_UK", "To launch (UK)"),
+        "prompt_tab":        os.environ.get("PROMPT_TAB_UK", "UK"),
     },
 }
 
@@ -237,8 +250,7 @@ def get_or_create_master_tab(gc, tab_name):
 # ============================================================
 def send_telegram(msg):
     try:
-        import requests
-        resp = requests.post(
+        resp = http_requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
@@ -853,6 +865,289 @@ def process_single_test(country="USA"):
         is_processing = False
 
 # ============================================================
+# KIE.AI (VEO 3.1) — VIDEO GENERATION API
+# ============================================================
+KIE_HEADERS = {
+    "Authorization": f"Bearer {KIE_API_KEY}",
+    "Content-Type": "application/json",
+}
+
+def kie_generate_video(prompt: str) -> str:
+    """Submit a text-to-video generation task to kie.ai. Returns taskId."""
+    resp = http_requests.post(
+        f"{KIE_API_BASE}/api/v1/veo/generate",
+        headers=KIE_HEADERS,
+        json={
+            "model": KIE_MODEL,
+            "prompt": prompt,
+            "aspect_ratio": KIE_ASPECT_RATIO,
+            "generationType": "TEXT_2_VIDEO",
+        },
+        timeout=30,
+    )
+    data = resp.json()
+    if data.get("code") != 200:
+        raise Exception(f"kie.ai generate error: {data.get('msg', resp.text[:200])}")
+    task_id = data["data"]["taskId"]
+    print(f"  kie.ai task created: {task_id}")
+    return task_id
+
+
+def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
+    """
+    Poll kie.ai until video is ready.
+    Returns the download URL of the generated video.
+    successFlag: 0=generating, 1=success, 2=failed, 3=generation failed
+    """
+    elapsed = 0
+    while elapsed < max_wait:
+        time.sleep(interval)
+        elapsed += interval
+        resp = http_requests.get(
+            f"{KIE_API_BASE}/api/v1/veo/record-info",
+            headers=KIE_HEADERS,
+            params={"taskId": task_id},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("code") != 200:
+            print(f"  kie.ai poll error: {data.get('msg', '')} — retrying...")
+            continue
+
+        flag = data["data"].get("successFlag", 0)
+        if flag == 1:
+            urls = data["data"].get("response", {}).get("resultUrls", [])
+            if urls:
+                print(f"  kie.ai video ready: {urls[0][:80]}...")
+                return urls[0]
+            raise Exception("kie.ai returned success but no resultUrls")
+        elif flag in (2, 3):
+            err = data["data"].get("errorMessage", "unknown error")
+            raise Exception(f"kie.ai generation failed (flag={flag}): {err}")
+
+        print(f"  kie.ai generating... ({elapsed}s / {max_wait}s)")
+
+    raise Exception(f"kie.ai timeout after {max_wait}s for task {task_id}")
+
+
+def kie_download_video(url: str, local_path: str):
+    """Download generated video from kie.ai URL to local file."""
+    resp = http_requests.get(url, stream=True, timeout=120)
+    resp.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"  kie.ai video downloaded: {local_path}")
+
+
+# ============================================================
+# PROMPT SHEET — read prompts per country
+# ============================================================
+PROMPT_SHEET_HEADERS = [
+    "Date", "prompt", "headline meta", "primary text", "title of video", "STATUS"
+]
+
+def get_prompts_for_country(gc, country_cfg, limit=None):
+    """
+    Read pending prompts from the per-country tab in the prompt sheet.
+    Returns list of dicts with row_index (1-based, header=row 1) and prompt data.
+    Skips rows where STATUS == 'done'.
+    """
+    if limit is None:
+        limit = MAX_VIDEOS_PER_RUN
+
+    prompt_tab = country_cfg["prompt_tab"]
+    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
+    try:
+        ws = spreadsheet.worksheet(prompt_tab)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=prompt_tab, rows=1000, cols=20)
+        ws.append_row(PROMPT_SHEET_HEADERS, value_input_option="USER_ENTERED")
+        print(f"  Created prompt tab '{prompt_tab}'")
+        return []
+
+    all_rows = ws.get_all_values()
+    if len(all_rows) <= 1:
+        return []
+
+    headers = [h.strip().lower() for h in all_rows[0]]
+    prompts = []
+
+    for idx, row in enumerate(all_rows[1:], start=2):
+        row_dict = {}
+        for h_idx, h in enumerate(headers):
+            row_dict[h] = row[h_idx].strip() if h_idx < len(row) else ""
+
+        status = row_dict.get("status", "").lower()
+        if status == "done":
+            continue
+
+        prompt_text = row_dict.get("prompt", "")
+        if not prompt_text:
+            continue
+
+        prompts.append({
+            "row_index": idx,
+            "prompt": prompt_text,
+            "title_of_video": row_dict.get("title of video", ""),
+            "headline_meta": row_dict.get("headline meta", ""),
+            "primary_text": row_dict.get("primary text", ""),
+        })
+
+        if len(prompts) >= limit:
+            break
+
+    return prompts
+
+
+def mark_prompt_done(gc, country_cfg, row_index):
+    """Mark a prompt row as 'done' in the prompt sheet."""
+    prompt_tab = country_cfg["prompt_tab"]
+    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
+    ws = spreadsheet.worksheet(prompt_tab)
+    headers = [h.strip().lower() for h in ws.row_values(1)]
+    if "status" in headers:
+        col = headers.index("status") + 1
+        ws.update_cell(row_index, col, "done")
+
+
+# ============================================================
+# GENERATE + PROCESS PIPELINE
+# ============================================================
+is_generating = False
+
+def generate_and_process(country=None):
+    """
+    Full pipeline: read prompts -> generate videos via kie.ai ->
+    upload to HOOKS folder (with .txt metadata) -> trigger editing.
+    """
+    global is_generating
+    now = datetime.datetime.now()
+    date_du_jour = now.strftime("%d.%m")
+
+    countries_to_process = {}
+    if country:
+        c = country.upper()
+        if c not in COUNTRY_CONFIG:
+            print(f"Pays inconnu: {c}. Disponibles: {list(COUNTRY_CONFIG.keys())}")
+            is_generating = False
+            return
+        countries_to_process = {c: COUNTRY_CONFIG[c]}
+    else:
+        countries_to_process = COUNTRY_CONFIG
+
+    try:
+        drive_service, gc = get_google_services()
+        total_generated = 0
+        total_errors = 0
+
+        for c_name, c_cfg in countries_to_process.items():
+            print(f"\n{'='*50}")
+            print(f"GENERATE: {c_name}")
+            print(f"{'='*50}")
+
+            prompts = get_prompts_for_country(gc, c_cfg)
+            if not prompts:
+                print(f"[{c_name}] Aucun prompt en attente")
+                continue
+
+            send_telegram(
+                f"[{c_name}] Generation demarree: {len(prompts)} video(s) a generer"
+            )
+
+            hooks_folder_id = c_cfg["hooks_folder_id"]
+
+            for i, p_data in enumerate(prompts, 1):
+                prompt_text = p_data["prompt"]
+                row_index = p_data["row_index"]
+                print(f"\n--- [{c_name}] Video {i}/{len(prompts)} (row {row_index}) ---")
+                print(f"  Prompt: {prompt_text[:100]}...")
+
+                try:
+                    # 1) Generate video via kie.ai
+                    task_id = kie_generate_video(prompt_text)
+
+                    # 2) Poll until ready
+                    video_url = kie_poll_video(task_id)
+
+                    # 3) Download to temp file
+                    time_str = now.strftime("%H%M%S")
+                    rand_suffix = os.urandom(3).hex()
+                    file_stem = f"veo_{time_str}_{rand_suffix}"
+                    local_video = f"/tmp/{file_stem}.mp4"
+                    kie_download_video(video_url, local_video)
+
+                    # 4) Upload video to HOOKS/<country>
+                    video_filename = f"{file_stem}.mp4"
+                    drive_upload_video(drive_service, local_video, hooks_folder_id, video_filename)
+                    print(f"  Uploaded {video_filename} to HOOKS/{c_name}")
+
+                    # 5) Create .txt metadata file in HOOKS/<country>
+                    meta_content = json.dumps({
+                        "video_title": p_data["title_of_video"] or DEFAULT_TITLE,
+                        "primary_text": p_data["primary_text"],
+                        "headline": p_data["headline_meta"],
+                        "video_prompt": prompt_text,
+                    }, ensure_ascii=False)
+                    txt_filename = f"{file_stem}.txt"
+                    txt_local = f"/tmp/{file_stem}.txt"
+                    with open(txt_local, "w", encoding="utf-8") as f:
+                        f.write(meta_content)
+                    media = MediaFileUpload(txt_local, mimetype="text/plain")
+                    drive_service.files().create(
+                        body={"name": txt_filename, "parents": [hooks_folder_id]},
+                        media_body=media,
+                        fields="id",
+                        supportsAllDrives=True,
+                    ).execute()
+                    print(f"  Uploaded {txt_filename} to HOOKS/{c_name}")
+
+                    # 6) Mark prompt as done
+                    mark_prompt_done(gc, c_cfg, row_index)
+                    print(f"  Row {row_index} marked as done")
+
+                    total_generated += 1
+
+                    # Cleanup temp files
+                    for tmp in [local_video, txt_local]:
+                        try:
+                            os.remove(tmp)
+                        except:
+                            pass
+
+                except Exception as e:
+                    total_errors += 1
+                    print(f"  ERREUR: {e}")
+                    send_telegram(
+                        f"[{c_name}] Erreur generation row {row_index}: {str(e)[:150]}"
+                    )
+
+        # All countries done generating — now trigger editing
+        msg = (
+            f"Generation terminee!\n\n"
+            f"Pays: {', '.join(countries_to_process.keys())}\n"
+            f"{total_generated} video(s) generee(s)\n"
+        )
+        if total_errors:
+            msg += f"{total_errors} erreur(s)\n"
+
+        if total_generated > 0:
+            msg += "\nLancement du montage..."
+            send_telegram(msg)
+            process_videos(country)
+        else:
+            send_telegram(msg)
+
+    except Exception as e:
+        send_telegram(f"Erreur critique generation: {str(e)[:200]}")
+        print(f"Erreur critique: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        is_generating = False
+
+
+# ============================================================
 # ENDPOINTS
 # ============================================================
 @app.get("/")
@@ -860,6 +1155,7 @@ def root():
     return {
         "status": "Video Editor Server running",
         "processing": is_processing,
+        "generating": is_generating,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
 
@@ -890,7 +1186,39 @@ def trigger_processing(background_tasks: BackgroundTasks, country: str = None):
 
 @app.get("/status")
 def status():
-    return {"processing": is_processing, "countries": list(COUNTRY_CONFIG.keys())}
+    return {
+        "processing": is_processing,
+        "generating": is_generating,
+        "countries": list(COUNTRY_CONFIG.keys()),
+    }
+
+@app.post("/generate")
+def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
+    """
+    Full pipeline: read prompts from sheet -> generate via kie.ai -> upload to HOOKS -> edit.
+    - Sans parametre : genere pour TOUS les pays.
+    - Avec country=UK : genere uniquement pour UK.
+    """
+    global is_generating
+    if is_generating or is_processing:
+        return JSONResponse({
+            "status": "already_running",
+            "message": "Une generation ou un montage est deja en cours",
+        })
+    if country and country.upper() not in COUNTRY_CONFIG:
+        return JSONResponse(
+            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
+            status_code=400,
+        )
+    is_generating = True
+    background_tasks.add_task(generate_and_process, country)
+    target = country.upper() if country else "ALL"
+    return JSONResponse({
+        "status": "started",
+        "country": target,
+        "max_videos_per_country": MAX_VIDEOS_PER_RUN,
+        "message": f"Generation + montage demarre en arriere-plan ({target})",
+    })
 
 @app.post("/test")
 def trigger_test(background_tasks: BackgroundTasks, country: str = "USA"):

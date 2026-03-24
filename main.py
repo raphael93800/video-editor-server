@@ -31,6 +31,33 @@ TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
 GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
+# ============================================================
+# MULTI-COUNTRY CONFIG
+# ============================================================
+# Each country has its own HOOKS subfolder, RESULTS subfolder,
+# Part2 video, and Master Sheet tab.
+# Subfolder IDs can be set via env vars, or will be auto-created
+# as subfolders of HOOKS_FOLDER_ID / RESULTS_FOLDER_ID.
+COUNTRY_CONFIG = {
+    "USA": {
+        "hooks_folder_id":   os.environ.get("HOOKS_USA_FOLDER_ID", ""),
+        "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", ""),
+        "part2_file_id":     PART2_FILE_ID,
+        "master_tab":        os.environ.get("MASTER_TAB_USA", "USA"),
+    },
+    "UK": {
+        "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", ""),
+        "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", ""),
+        "part2_file_id":     PART2_UK_FILE_ID,
+        "master_tab":        os.environ.get("MASTER_TAB_UK", "UK"),
+    },
+}
+
+MASTER_SHEET_HEADERS = [
+    "Ad_Name", "Drive_Share_Link", "Direct_Download_Link",
+    "Campaign_Name", "AdSet_Name", "Primary_Text", "Headline", "Video_Prompt"
+]
+
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
 processing_lock = threading.Lock()
@@ -74,7 +101,7 @@ def drive_list_all_files(drive_service, folder_id):
     return out
 
 def drive_list_videos(drive_service, folder_id):
-    """Liste uniquement les fichiers vidéo (.mp4, .mov) dans HOOKS."""
+    """Liste uniquement les fichiers vidéo (.mp4, .mov)."""
     all_files = drive_list_all_files(drive_service, folder_id)
     videos = [f for f in all_files if f["name"].lower().strip().endswith((".mp4", ".mov"))]
     videos.sort(key=lambda x: x["name"].lower())
@@ -85,7 +112,7 @@ def drive_find_txt_for_hook(drive_service, folder_id, hook_name):
     Cherche le fichier .txt qui correspond au hook.
     n8n crée veo_HHMMSS_xxx.mp4 ET veo_HHMMSS_xxx.txt dans le même dossier.
     """
-    stem = os.path.splitext(hook_name)[0]  # "veo_HHMMSS_xxx"
+    stem = os.path.splitext(hook_name)[0]
     txt_name = stem + ".txt"
     all_files = drive_list_all_files(drive_service, folder_id)
     for f in all_files:
@@ -176,6 +203,48 @@ def make_drive_links(file_id):
     share_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
     direct_download = f"https://drive.google.com/uc?export=download&id={file_id}"
     return share_link, direct_download
+
+# ============================================================
+# MULTI-COUNTRY : auto-create subfolders and resolve IDs
+# ============================================================
+def ensure_country_folders(drive_service):
+    """
+    For each country in COUNTRY_CONFIG, ensure HOOKS/<country> and
+    RESULTATS/<country> subfolders exist. If the env var is empty,
+    create the subfolder under the parent HOOKS/RESULTS folder.
+    Mutates COUNTRY_CONFIG in-place with resolved folder IDs.
+    """
+    for country, cfg in COUNTRY_CONFIG.items():
+        if not cfg["hooks_folder_id"]:
+            folder_id = drive_get_or_create_folder(drive_service, HOOKS_FOLDER_ID, country)
+            cfg["hooks_folder_id"] = folder_id
+            print(f"📁 HOOKS/{country} → {folder_id}")
+        else:
+            print(f"📁 HOOKS/{country} → {cfg['hooks_folder_id']} (env)")
+
+        if not cfg["results_folder_id"]:
+            folder_id = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, country)
+            cfg["results_folder_id"] = folder_id
+            print(f"📁 RESULTATS/{country} → {folder_id}")
+        else:
+            print(f"📁 RESULTATS/{country} → {cfg['results_folder_id']} (env)")
+
+# ============================================================
+# MASTER SHEET : get or create tab per country
+# ============================================================
+def get_or_create_master_tab(gc, tab_name):
+    """
+    Opens the Master Sheet and returns the worksheet for the given tab.
+    Creates the tab with headers if it doesn't exist.
+    """
+    spreadsheet = gc.open_by_url(MASTER_SHEET_URL)
+    try:
+        ws = spreadsheet.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=tab_name, rows=1000, cols=20)
+        ws.append_row(MASTER_SHEET_HEADERS, value_input_option="USER_ENTERED")
+        print(f"📋 Onglet '{tab_name}' créé dans le Master Sheet")
+    return ws
 
 # ============================================================
 # TELEGRAM
@@ -350,30 +419,29 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
 # ============================================================
 def process_single_hook(drive_service, master_ws, hook_file, global_index,
                         date_du_jour, edited_folder_id, original_folder_id,
-                        local_part2_clean):
+                        local_part2_clean, hooks_folder_id, country):
     """
     Monte une seule vidéo hook + Part2.
-    Lit les métadonnées depuis le fichier .txt créé par n8n dans HOOKS.
+    Lit les métadonnées depuis le fichier .txt créé par n8n dans le dossier HOOKS/<country>.
     Retourne True si succès, False si erreur.
     """
     hook_id   = hook_file["id"]
     hook_name = hook_file["name"]
     nom_final = f"{date_du_jour}_V{global_index}.mp4"
 
-    local_hook       = f"/tmp/hook_{global_index}.mp4"
-    local_hook_clean = f"/tmp/hook_clean_{global_index}.mp4"
-    local_hook_audio = f"/tmp/hook_audio_{global_index}.wav"
-    local_hook_cut   = f"/tmp/hook_cut_{global_index}.mp4"
-    local_concat     = f"/tmp/concat_{global_index}.mp4"
-    local_audio      = f"/tmp/audio_{global_index}.wav"
-    local_srt        = f"/tmp/subs_{global_index}.srt"
-    local_out        = f"/tmp/out_{global_index}.mp4"
-    concat_list      = f"/tmp/list_{global_index}.txt"
+    local_hook       = f"/tmp/hook_{country}_{global_index}.mp4"
+    local_hook_clean = f"/tmp/hook_clean_{country}_{global_index}.mp4"
+    local_hook_audio = f"/tmp/hook_audio_{country}_{global_index}.wav"
+    local_hook_cut   = f"/tmp/hook_cut_{country}_{global_index}.mp4"
+    local_concat     = f"/tmp/concat_{country}_{global_index}.mp4"
+    local_audio      = f"/tmp/audio_{country}_{global_index}.wav"
+    local_srt        = f"/tmp/subs_{country}_{global_index}.srt"
+    local_out        = f"/tmp/out_{country}_{global_index}.mp4"
+    concat_list      = f"/tmp/list_{country}_{global_index}.txt"
 
     try:
         # ── 1. Lire les métadonnées depuis le fichier .txt ──────────────────
-        # n8n crée veo_HHMMSS_xxx.txt avec le même nom que le hook .mp4
-        txt_file_id = drive_find_txt_for_hook(drive_service, HOOKS_FOLDER_ID, hook_name)
+        txt_file_id = drive_find_txt_for_hook(drive_service, hooks_folder_id, hook_name)
         if txt_file_id:
             meta = drive_read_txt_metadata(drive_service, txt_file_id)
             if meta:
@@ -381,24 +449,24 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
                 video_headline = meta["headline"]
                 video_primary  = meta["primary_text"]
                 video_prompt   = meta["video_prompt"]
-                print(f"📄 Métadonnées lues depuis .txt: titre='{video_title}'")
+                print(f"📄 [{country}] Métadonnées lues depuis .txt: titre='{video_title}'")
             else:
                 video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
         else:
-            print(f"⚠️ Pas de fichier .txt trouvé pour {hook_name} — utilisation des valeurs par défaut")
+            print(f"⚠️ [{country}] Pas de fichier .txt trouvé pour {hook_name} — valeurs par défaut")
             video_title, video_headline, video_primary, video_prompt = DEFAULT_TITLE, "", "", ""
 
         # ── 2. Télécharger et ré-encoder le hook ────────────────────────────
         drive_download_file(drive_service, hook_id, local_hook)
-        print(f"📥 Hook téléchargé: {hook_name}")
+        print(f"📥 [{country}] Hook téléchargé: {hook_name}")
         reencode_video(local_hook, local_hook_clean)
-        print(f"🔄 Hook ré-encodé")
+        print(f"🔄 [{country}] Hook ré-encodé")
 
         if not has_video_stream(local_hook_clean):
             raise Exception(f"Pas de piste vidéo dans {hook_name} après ré-encodage")
 
         hook_duration = get_video_duration(local_hook_clean)
-        print(f"⏱ Durée hook: {hook_duration:.2f}s")
+        print(f"⏱ [{country}] Durée hook: {hook_duration:.2f}s")
 
         # ── 3. Détecter les bornes de parole ────────────────────────────────
         subprocess.run([
@@ -407,7 +475,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             local_hook_audio
         ], check=True, capture_output=True)
         start_t, end_t, _ = get_speech_bounds(local_hook_audio, hook_duration)
-        print(f"🎤 Parole: {start_t:.2f}s → {end_t:.2f}s")
+        print(f"🎤 [{country}] Parole: {start_t:.2f}s → {end_t:.2f}s")
 
         # ── 4. Couper le hook ───────────────────────────────────────────────
         subprocess.run([
@@ -417,7 +485,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             "-c:a", "aac", "-ar", "44100",
             local_hook_cut
         ], check=True, capture_output=True)
-        print(f"✂️ Hook coupé")
+        print(f"✂️ [{country}] Hook coupé")
 
         if not has_video_stream(local_hook_cut):
             raise Exception("Hook coupé sans piste vidéo")
@@ -434,7 +502,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             "-movflags", "+faststart",
             local_concat
         ], check=True, capture_output=True)
-        print(f"🔗 Concaténation OK")
+        print(f"🔗 [{country}] Concaténation OK")
 
         if not has_video_stream(local_concat):
             raise Exception("Vidéo concaténée sans piste vidéo")
@@ -450,7 +518,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
         srt_content = generate_srt(local_audio)
         with open(local_srt, "w", encoding="utf-8") as sf:
             sf.write(srt_content)
-        print(f"📝 Sous-titres générés")
+        print(f"📝 [{country}] Sous-titres générés")
 
         # ── 8. Construire le filtre titre ───────────────────────────────────
         title_clean = video_title.replace("\n", " ").strip()
@@ -507,7 +575,7 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
         ], capture_output=True, text=True)
 
         if result.returncode != 0:
-            print(f"⚠️ Erreur overlay: {result.stderr[-500:]}")
+            print(f"⚠️ [{country}] Erreur overlay: {result.stderr[-500:]}")
             import shutil
             shutil.copy(local_concat, local_out)
 
@@ -515,20 +583,19 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
             raise Exception("Fichier final sans piste vidéo")
 
         final_duration = get_video_duration(local_out)
-        print(f"✅ Vidéo finale: {final_duration:.2f}s")
+        print(f"✅ [{country}] Vidéo finale: {final_duration:.2f}s")
 
         # ── 10. Upload vers Drive ────────────────────────────────────────────
         out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
         drive_move_file(drive_service, hook_id, original_folder_id)
 
-        # Supprimer le fichier .txt de HOOKS après traitement
         if txt_file_id:
             drive_delete_file(drive_service, txt_file_id)
 
         # ── 11. Log dans le Master Sheet ────────────────────────────────────
         version = ((global_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-        campaign_name = f"C{date_du_jour}_{version:02d}"
-        adset_name    = f"adset{version}_{date_du_jour}"
+        campaign_name = f"C{date_du_jour}_{country}_{version:02d}"
+        adset_name    = f"adset{version}_{country}_{date_du_jour}"
         drive_link, direct_link = make_drive_links(out_id)
         master_ws.append_row(
             [
@@ -540,16 +607,15 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
                 video_primary,                   # Primary_Text
                 video_headline,                  # Headline
                 video_prompt,                    # Video_Prompt
-                # statut laissé vide — mis à "ready" par n8n quand lancé sur Meta
             ],
             value_input_option="USER_ENTERED"
         )
-        print(f"✅ {nom_final} monté et uploadé avec succès")
+        print(f"✅ [{country}] {nom_final} monté et uploadé avec succès")
         return True
 
     except Exception as e:
-        print(f"❌ Erreur sur {hook_name}: {e}")
-        send_telegram(f"⚠️ Erreur sur {hook_name}: {str(e)[:150]}")
+        print(f"❌ [{country}] Erreur sur {hook_name}: {e}")
+        send_telegram(f"⚠️ [{country}] Erreur sur {hook_name}: {str(e)[:150]}")
         return False
 
     finally:
@@ -562,100 +628,143 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
                 pass
 
 # ============================================================
-# MONTAGE PRINCIPAL — BOUCLE CONTINUE
+# PROCESS ONE COUNTRY — all hooks in its folder
 # ============================================================
-def process_videos(region="FR"):
+def process_country(drive_service, gc, country, cfg, date_du_jour):
     """
-    Boucle principale :
-    1. Traite tous les hooks présents dans HOOKS
-    2. Attend 30s et revérifie
-    3. S'arrête seulement si HOOKS est vide 2 fois de suite (1 min d'inactivité)
-    Permet à n8n de générer les hooks en batches de 5 pendant que Render monte les précédents.
+    Process all hooks for a single country.
+    Returns (success_count, error_count).
+    """
+    hooks_folder_id  = cfg["hooks_folder_id"]
+    results_folder_id = cfg["results_folder_id"]
+    part2_file_id    = cfg["part2_file_id"]
+    master_tab       = cfg["master_tab"]
 
-    region: "FR" (default) ou "UK" — sélectionne la vidéo Part2 correspondante.
+    local_part2       = f"/tmp/partie2_{country}.mp4"
+    local_part2_clean = f"/tmp/partie2_clean_{country}.mp4"
+
+    master_ws = get_or_create_master_tab(gc, master_tab)
+
+    # Prepare results subfolders for today
+    today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
+    edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
+    original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
+
+    # Download and re-encode Part2 once per country
+    for p in [local_part2, local_part2_clean]:
+        if os.path.exists(p):
+            os.remove(p)
+    drive_download_file(drive_service, part2_file_id, local_part2)
+    reencode_video(local_part2, local_part2_clean)
+    print(f"✅ [{country}] Part2 téléchargée et ré-encodée")
+
+    # Video numbering: count existing videos for this country today
+    today_prefix = f"{date_du_jour}_V"
+    existing_rows = master_ws.get_all_values()
+    existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+    global_index = existing_today + 1
+    print(f"📊 [{country}] {existing_today} vidéos aujourd'hui → prochaine: V{global_index}")
+
+    success_count = 0
+    error_count = 0
+    empty_checks = 0
+
+    while True:
+        hook_files = drive_list_videos(drive_service, hooks_folder_id)
+
+        if not hook_files:
+            empty_checks += 1
+            print(f"📭 [{country}] HOOKS vide ({empty_checks}/2)")
+            if empty_checks >= 2:
+                print(f"🏁 [{country}] HOOKS vide 2 fois de suite — terminé")
+                break
+            print(f"⏳ [{country}] Attente 30s avant de revérifier...")
+            time.sleep(30)
+            continue
+
+        empty_checks = 0
+        send_telegram(f"🎬 *[{country}]* — {len(hook_files)} hook(s) à monter (V{global_index}→V{global_index + len(hook_files) - 1})...")
+
+        for hook_file in hook_files:
+            ok = process_single_hook(
+                drive_service=drive_service,
+                master_ws=master_ws,
+                hook_file=hook_file,
+                global_index=global_index,
+                date_du_jour=date_du_jour,
+                edited_folder_id=edited_folder_id,
+                original_folder_id=original_folder_id,
+                local_part2_clean=local_part2_clean,
+                hooks_folder_id=hooks_folder_id,
+                country=country,
+            )
+            if ok:
+                success_count += 1
+            else:
+                error_count += 1
+            global_index += 1
+
+        print(f"⏳ [{country}] Batch terminé — attente 30s avant de revérifier...")
+        time.sleep(30)
+
+    # Cleanup Part2 temp files
+    for p in [local_part2, local_part2_clean]:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except:
+            pass
+
+    return success_count, error_count
+
+# ============================================================
+# MONTAGE PRINCIPAL — MULTI-COUNTRY
+# ============================================================
+def process_videos(country=None):
+    """
+    Main processing loop.
+    - If country is specified (e.g. "UK"), only process that country's HOOKS folder.
+    - If country is None, process ALL countries sequentially.
     """
     global is_processing
     now = datetime.datetime.now()
     date_du_jour = now.strftime("%d.%m")
-    local_part2 = "/tmp/partie2.mp4"
-    local_part2_clean = "/tmp/partie2_clean.mp4"
 
-    part2_id = PART2_UK_FILE_ID if region.upper() == "UK" else PART2_FILE_ID
-    print(f"🌍 Région: {region.upper()} — Part2 ID: {part2_id}")
+    countries_to_process = {}
+    if country:
+        c = country.upper()
+        if c not in COUNTRY_CONFIG:
+            print(f"❌ Pays inconnu: {c}. Pays disponibles: {list(COUNTRY_CONFIG.keys())}")
+            is_processing = False
+            return
+        countries_to_process = {c: COUNTRY_CONFIG[c]}
+    else:
+        countries_to_process = COUNTRY_CONFIG
 
     try:
         drive_service, gc = get_google_services()
-        master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
 
-        # Préparer les dossiers Drive
-        today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
-        edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
-        original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
+        # Ensure HOOKS/<country> and RESULTATS/<country> folders exist
+        ensure_country_folders(drive_service)
 
-        # Télécharger et ré-encoder Part2 (une seule fois pour toute la session)
-        for p in [local_part2, local_part2_clean]:
-            if os.path.exists(p):
-                os.remove(p)
-        drive_download_file(drive_service, part2_id, local_part2)
-        reencode_video(local_part2, local_part2_clean)
-        print(f"✅ Part2 ({region.upper()}) téléchargée et ré-encodée")
+        total_success = 0
+        total_errors = 0
 
-        success_count = 0
-        error_count = 0
-        empty_checks = 0
+        for c_name, c_cfg in countries_to_process.items():
+            print(f"\n{'='*50}")
+            print(f"🌍 Traitement: {c_name}")
+            print(f"{'='*50}")
 
-        # Numérotation : compter les vidéos du jour déjà dans le master sheet
-        today_prefix = f"{date_du_jour}_V"
-        existing_rows = master_ws.get_all_values()
-        existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-        global_index = existing_today + 1
-        print(f"📊 {existing_today} vidéos aujourd'hui → prochaine: V{global_index}")
+            s, e = process_country(drive_service, gc, c_name, c_cfg, date_du_jour)
+            total_success += s
+            total_errors += e
 
-        # ── Boucle principale ────────────────────────────────────────────────
-        while True:
-            hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
-
-            if not hook_files:
-                empty_checks += 1
-                print(f"📭 HOOKS vide ({empty_checks}/2)")
-                if empty_checks >= 2:
-                    print("🏁 HOOKS vide 2 fois de suite — arrêt de la boucle")
-                    break
-                print("⏳ Attente 30s avant de revérifier...")
-                time.sleep(30)
-                continue
-
-            # Des hooks sont disponibles → on traite
-            empty_checks = 0
-            send_telegram(f"🎬 *Video Editor* — {len(hook_files)} hook(s) à monter (V{global_index}→V{global_index + len(hook_files) - 1})...")
-
-            for hook_file in hook_files:
-                ok = process_single_hook(
-                    drive_service=drive_service,
-                    master_ws=master_ws,
-                    hook_file=hook_file,
-                    global_index=global_index,
-                    date_du_jour=date_du_jour,
-                    edited_folder_id=edited_folder_id,
-                    original_folder_id=original_folder_id,
-                    local_part2_clean=local_part2_clean,
-                )
-                if ok:
-                    success_count += 1
-                else:
-                    error_count += 1
-                global_index += 1
-
-            # Après le batch : attendre 30s et revérifier
-            print("⏳ Batch terminé — attente 30s avant de revérifier HOOKS...")
-            time.sleep(30)
-
-        # Rapport final
+        # Final report
         msg = f"🚀 *Video Editor — Mission accomplie!*\n\n"
-        msg += f"✅ {success_count} vidéo(s) montée(s) avec succès\n"
-        if error_count > 0:
-            msg += f"❌ {error_count} erreur(s)\n"
-        msg += f"📁 Résultats dans: RESULTATS/{date_du_jour}/edited/"
+        msg += f"🌍 Pays traités: {', '.join(countries_to_process.keys())}\n"
+        msg += f"✅ {total_success} vidéo(s) montée(s) avec succès\n"
+        if total_errors > 0:
+            msg += f"❌ {total_errors} erreur(s)\n"
         send_telegram(msg)
 
     except Exception as e:
@@ -683,7 +792,6 @@ def archive_old_prompts():
         _, gc = get_google_services()
         spreadsheet = gc.open_by_url(VIDEOS_SHEET_URL)
 
-        # Récupérer les deux onglets
         try:
             veo_ws = spreadsheet.worksheet("Veo")
         except Exception:
@@ -693,7 +801,6 @@ def archive_old_prompts():
         try:
             old_ws = spreadsheet.worksheet("old prompt")
         except Exception:
-            # Créer l'onglet s'il n'existe pas
             old_ws = spreadsheet.add_worksheet(title="old prompt", rows=1000, cols=20)
             print("📋 Onglet 'old prompt' créé")
 
@@ -704,7 +811,6 @@ def archive_old_prompts():
         headers = all_rows[0]
         data_rows = all_rows[1:]
 
-        # Trouver les colonnes date et STATUS
         headers_lower = [h.lower().strip() for h in headers]
         date_col = next((i for i, h in enumerate(headers_lower) if "date" in h), 0)
         status_col = next((i for i, h in enumerate(headers_lower) if "status" in h), None)
@@ -714,7 +820,7 @@ def archive_old_prompts():
             return
 
         today = datetime.date.today()
-        rows_to_archive = []   # (row_index_in_sheet, row_data)
+        rows_to_archive = []
         rows_to_keep    = []
 
         for i, row in enumerate(data_rows):
@@ -723,13 +829,11 @@ def archive_old_prompts():
                 rows_to_keep.append(row)
                 continue
 
-            # Vérifier la date — formats acceptés : dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, d/m
             date_val = row[date_col].strip() if len(row) > date_col else ""
             row_date = None
             for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d/%m", "%m/%d"):
                 try:
                     parsed = datetime.datetime.strptime(date_val, fmt)
-                    # Si le format ne contient pas l'année, on suppose l'année courante
                     if "%Y" not in fmt:
                         parsed = parsed.replace(year=today.year)
                     row_date = parsed.date()
@@ -737,7 +841,6 @@ def archive_old_prompts():
                 except ValueError:
                     continue
 
-            # Si pas de date ou date < aujourd'hui → archiver
             if row_date is None or row_date < today:
                 rows_to_archive.append(row)
             else:
@@ -747,8 +850,6 @@ def archive_old_prompts():
             print("📋 Archivage : aucune ligne à déplacer")
             return
 
-        # Ajouter les lignes dans old prompt
-        # S'assurer que l'en-tête existe dans old prompt
         old_data = old_ws.get_all_values()
         if not old_data:
             old_ws.append_row(headers, value_input_option="USER_ENTERED")
@@ -756,7 +857,6 @@ def archive_old_prompts():
         for row in rows_to_archive:
             old_ws.append_row(row, value_input_option="USER_ENTERED")
 
-        # Réécrire Veo sans les lignes archivées
         veo_ws.clear()
         veo_ws.append_row(headers, value_input_option="USER_ENTERED")
         for row in rows_to_keep:
@@ -771,46 +871,57 @@ def archive_old_prompts():
 
 def archive_loop():
     """Thread qui tourne toutes les heures pour archiver les vieux prompts."""
-    # Première vérification 1h après le démarrage
     time.sleep(3600)
     while True:
         print("🕐 Vérification archivage automatique...")
         archive_old_prompts()
-        time.sleep(3600)  # toutes les heures
+        time.sleep(3600)
 
 
 # ============================================================
 # TEST — Monte un seul hook pour vérifier le pipeline
 # ============================================================
-def process_single_test(region="FR"):
-    """Monte uniquement le premier hook trouvé dans HOOKS, sans boucle."""
+def process_single_test(country="USA"):
+    """Monte uniquement le premier hook trouvé dans HOOKS/<country>, sans boucle."""
     global is_processing
+    country = country.upper()
+
+    if country not in COUNTRY_CONFIG:
+        print(f"❌ Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}")
+        is_processing = False
+        return
+
+    cfg = COUNTRY_CONFIG[country]
     now = datetime.datetime.now()
     date_du_jour = now.strftime("%d.%m")
-    local_part2 = "/tmp/partie2.mp4"
-    local_part2_clean = "/tmp/partie2_clean.mp4"
+    local_part2 = f"/tmp/partie2_{country}.mp4"
+    local_part2_clean = f"/tmp/partie2_clean_{country}.mp4"
 
-    part2_id = PART2_UK_FILE_ID if region.upper() == "UK" else PART2_FILE_ID
-    print(f"🧪 TEST — Région: {region.upper()} — Part2 ID: {part2_id}")
+    print(f"🧪 TEST — Pays: {country} — Part2 ID: {cfg['part2_file_id']}")
 
     try:
         drive_service, gc = get_google_services()
-        master_ws = gc.open_by_url(MASTER_SHEET_URL).sheet1
+        ensure_country_folders(drive_service)
 
-        today_folder_id    = drive_get_or_create_folder(drive_service, RESULTS_FOLDER_ID, date_du_jour)
+        hooks_folder_id = cfg["hooks_folder_id"]
+        results_folder_id = cfg["results_folder_id"]
+
+        master_ws = get_or_create_master_tab(gc, cfg["master_tab"])
+
+        today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
         edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
         original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
 
         for p in [local_part2, local_part2_clean]:
             if os.path.exists(p):
                 os.remove(p)
-        drive_download_file(drive_service, part2_id, local_part2)
+        drive_download_file(drive_service, cfg["part2_file_id"], local_part2)
         reencode_video(local_part2, local_part2_clean)
-        print(f"✅ Part2 ({region.upper()}) téléchargée et ré-encodée")
+        print(f"✅ [{country}] Part2 téléchargée et ré-encodée")
 
-        hook_files = drive_list_videos(drive_service, HOOKS_FOLDER_ID)
+        hook_files = drive_list_videos(drive_service, hooks_folder_id)
         if not hook_files:
-            msg = "🧪 TEST — Aucun hook trouvé dans HOOKS"
+            msg = f"🧪 TEST [{country}] — Aucun hook trouvé dans HOOKS/{country}"
             print(msg)
             send_telegram(msg)
             return
@@ -821,7 +932,7 @@ def process_single_test(region="FR"):
         global_index = existing_today + 1
 
         hook_file = hook_files[0]
-        send_telegram(f"🧪 *TEST* — Montage de {hook_file['name']} (Part2 {region.upper()})...")
+        send_telegram(f"🧪 *TEST [{country}]* — Montage de {hook_file['name']}...")
 
         ok = process_single_hook(
             drive_service=drive_service,
@@ -832,15 +943,17 @@ def process_single_test(region="FR"):
             edited_folder_id=edited_folder_id,
             original_folder_id=original_folder_id,
             local_part2_clean=local_part2_clean,
+            hooks_folder_id=hooks_folder_id,
+            country=country,
         )
 
         if ok:
-            send_telegram(f"🧪✅ *TEST réussi* — {hook_file['name']} monté avec Part2 {region.upper()}")
+            send_telegram(f"🧪✅ *TEST [{country}] réussi* — {hook_file['name']}")
         else:
-            send_telegram(f"🧪❌ *TEST échoué* — {hook_file['name']}")
+            send_telegram(f"🧪❌ *TEST [{country}] échoué* — {hook_file['name']}")
 
     except Exception as e:
-        send_telegram(f"🧪❌ *TEST — Erreur:* {str(e)[:200]}")
+        send_telegram(f"🧪❌ *TEST [{country}] — Erreur:* {str(e)[:200]}")
         print(f"Erreur test: {e}")
         import traceback
         traceback.print_exc()
@@ -852,46 +965,61 @@ def process_single_test(region="FR"):
 # ============================================================
 @app.get("/")
 def root():
-    return {"status": "Video Editor Server running", "processing": is_processing}
+    return {
+        "status": "Video Editor Server running",
+        "processing": is_processing,
+        "countries": list(COUNTRY_CONFIG.keys()),
+    }
 
 @app.post("/process")
-def trigger_processing(background_tasks: BackgroundTasks, region: str = "FR"):
+def trigger_processing(background_tasks: BackgroundTasks, country: str = None):
     """
-    Lance le montage de tous les hooks dans HOOKS.
-    Paramètre region : "FR" (défaut) ou "UK" pour utiliser la partie2 UK.
-    Exemple: POST /process?region=UK
+    Lance le montage des hooks.
+    - Sans paramètre : traite TOUS les pays (HOOKS/USA, HOOKS/UK, etc.)
+    - Avec country=UK : traite uniquement les hooks UK.
+    Exemple: POST /process?country=UK
     """
     global is_processing
     if is_processing:
         return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
+    if country and country.upper() not in COUNTRY_CONFIG:
+        return JSONResponse(
+            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
+            status_code=400
+        )
     is_processing = True
-    background_tasks.add_task(process_videos, region)
+    background_tasks.add_task(process_videos, country)
+    target = country.upper() if country else "ALL"
     return JSONResponse({
         "status": "started",
-        "region": region.upper(),
-        "message": f"Montage démarré en arrière-plan (Part2 {region.upper()})"
+        "country": target,
+        "message": f"Montage démarré en arrière-plan ({target})"
     })
 
 @app.get("/status")
 def status():
-    return {"processing": is_processing}
+    return {"processing": is_processing, "countries": list(COUNTRY_CONFIG.keys())}
 
 @app.post("/test")
-def trigger_test(background_tasks: BackgroundTasks, region: str = "FR"):
+def trigger_test(background_tasks: BackgroundTasks, country: str = "USA"):
     """
-    Monte UNE seule vidéo (la première dans HOOKS) pour tester.
-    Paramètre region : "FR" (défaut) ou "UK".
-    Exemple: POST /test?region=UK
+    Monte UNE seule vidéo (la première dans HOOKS/<country>) pour tester.
+    Exemple: POST /test?country=UK
     """
     global is_processing
     if is_processing:
         return JSONResponse({"status": "already_running", "message": "Un montage est déjà en cours"})
+    if country.upper() not in COUNTRY_CONFIG:
+        return JSONResponse(
+            {"status": "error", "message": f"Pays inconnu: {country}. Disponibles: {list(COUNTRY_CONFIG.keys())}"},
+            status_code=400
+        )
     is_processing = True
-    background_tasks.add_task(process_single_test, region)
+    background_tasks.add_task(process_single_test, country)
     return JSONResponse({
         "status": "started",
-        "region": region.upper(),
-        "message": f"Test d'un seul hook lancé (Part2 {region.upper()})"
+        "country": country.upper(),
+        "message": f"Test d'un seul hook lancé (HOOKS/{country.upper()})"
     })
 
 @app.post("/archive")

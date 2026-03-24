@@ -238,13 +238,15 @@ def get_or_create_master_tab(gc, tab_name):
 def send_telegram(msg):
     try:
         import requests
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
         )
-    except:
-        pass
+        if not resp.ok:
+            print(f"⚠️ Telegram error: {resp.status_code} — {resp.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ Telegram send failed: {e}")
 
 # ============================================================
 # FFMPEG : obtenir la durée d'une vidéo
@@ -573,7 +575,14 @@ def process_single_hook(drive_service, master_ws, hook_file, global_index,
 
         # ── 10. Upload vers Drive ────────────────────────────────────────────
         out_id = drive_upload_video(drive_service, local_out, edited_folder_id, nom_final)
-        drive_move_file(drive_service, hook_id, original_folder_id)
+
+        # Move original hook from HOOKS/<country> to original/ folder
+        try:
+            drive_move_file(drive_service, hook_id, original_folder_id)
+            print(f"📦 [{country}] Hook déplacé vers original/")
+        except Exception as move_err:
+            print(f"⚠️ [{country}] Erreur move, suppression du hook: {move_err}")
+            drive_delete_file(drive_service, hook_id)
 
         if txt_file_id:
             drive_delete_file(drive_service, txt_file_id)

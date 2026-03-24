@@ -20,8 +20,8 @@ app = FastAPI()
 # CONFIGURATION (via variables d'environnement sur Render)
 # ============================================================
 MASTER_SHEET_URL    = os.environ.get("MASTER_SHEET_URL",    "https://docs.google.com/spreadsheets/d/1tlB7auPNU_fXUiuIbI-5EbmizInw4rw35tB2SWEvPas/edit")
-HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "12KQp_2d0witKtbASqM2caLW8zCfdIz00")
-RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ")
+HOOKS_FOLDER_ID     = os.environ.get("HOOKS_FOLDER_ID",     "1xBxtWYJl-N0ydQtms6xxf7OZHlMpCjid")
+RESULTS_FOLDER_ID   = os.environ.get("RESULTS_FOLDER_ID",   "1nqgRKZbsdCykGRyuJjFJD5cp_AejFhlC")
 PART2_FILE_ID       = os.environ.get("PART2_FILE_ID",       "1INNY-MUaI0xFPd7dafeGx5_5TE9CwlbL")
 PART2_UK_FILE_ID    = os.environ.get("PART2_UK_FILE_ID",    "1_G7pAuZx-5-xCFEsurI5CXiQVQfM2Csu")
 DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no one told you about")
@@ -42,18 +42,14 @@ OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 #                     "RESULTS/USA", "RESULTS/UK" inside RESULTS parent.
 COUNTRY_CONFIG = {
     "USA": {
-        "hooks_folder_id":   os.environ.get("HOOKS_USA_FOLDER_ID", ""),
-        "hooks_folder_name": "HOOKS/USA",
-        "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", ""),
-        "results_folder_name": "RESULTS/USA",
+        "hooks_folder_id":   os.environ.get("HOOKS_USA_FOLDER_ID", "12KQp_2d0witKtbASqM2caLW8zCfdIz00"),
+        "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ"),
         "part2_file_id":     PART2_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_USA", "To launch (USA)"),
     },
     "UK": {
-        "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", ""),
-        "hooks_folder_name": "HOOKS/UK",
-        "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", ""),
-        "results_folder_name": "RESULTS/UK",
+        "hooks_folder_id":   os.environ.get("HOOKS_UK_FOLDER_ID", "1y7-L9PpZmEBzAFVCAHfNX5pMQaExiIOV"),
+        "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", "1SeDVgbd1Fo3SyYdxRbmP4QeIpuqyAoni"),
         "part2_file_id":     PART2_UK_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_UK", "To launch (UK)"),
     },
@@ -213,32 +209,11 @@ def make_drive_links(file_id):
 # ============================================================
 # MULTI-COUNTRY : auto-create subfolders and resolve IDs
 # ============================================================
-def ensure_country_folders(drive_service):
-    """
-    For each country in COUNTRY_CONFIG, ensure the HOOKS and RESULTS
-    subfolders exist with the correct names (e.g. "HOOKS/USA", "RESULTS/UK").
-    If the env var folder ID is empty, find or create the subfolder
-    under the parent HOOKS/RESULTS folder.
-    Mutates COUNTRY_CONFIG in-place with resolved folder IDs.
-    """
+def log_country_folders():
+    """Log the folder IDs being used for each country."""
     for country, cfg in COUNTRY_CONFIG.items():
-        if not cfg["hooks_folder_id"]:
-            folder_id = drive_get_or_create_folder(
-                drive_service, HOOKS_FOLDER_ID, cfg["hooks_folder_name"]
-            )
-            cfg["hooks_folder_id"] = folder_id
-            print(f"📁 {cfg['hooks_folder_name']} → {folder_id}")
-        else:
-            print(f"📁 {cfg['hooks_folder_name']} → {cfg['hooks_folder_id']} (env)")
-
-        if not cfg["results_folder_id"]:
-            folder_id = drive_get_or_create_folder(
-                drive_service, RESULTS_FOLDER_ID, cfg["results_folder_name"]
-            )
-            cfg["results_folder_id"] = folder_id
-            print(f"📁 {cfg['results_folder_name']} → {folder_id}")
-        else:
-            print(f"📁 {cfg['results_folder_name']} → {cfg['results_folder_id']} (env)")
+        print(f"📁 HOOKS/{country} → {cfg['hooks_folder_id']}")
+        print(f"📁 RESULTS/{country} → {cfg['results_folder_id']}")
 
 # ============================================================
 # MASTER SHEET : get or create tab per country
@@ -756,7 +731,7 @@ def process_videos(country=None):
         drive_service, gc = get_google_services()
 
         # Ensure HOOKS/<country> and RESULTATS/<country> folders exist
-        ensure_country_folders(drive_service)
+        log_country_folders()
 
         total_success = 0
         total_errors = 0
@@ -809,7 +784,7 @@ def process_single_test(country="USA"):
 
     try:
         drive_service, gc = get_google_services()
-        ensure_country_folders(drive_service)
+        log_country_folders()
 
         hooks_folder_id = cfg["hooks_folder_id"]
         results_folder_id = cfg["results_folder_id"]

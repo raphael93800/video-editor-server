@@ -691,13 +691,6 @@ def generate_and_process(country=None):
             print(f"PARALLEL GENERATE + EDIT: {c_name}")
             print(f"{'='*50}")
 
-            prompts = get_prompts_for_country(gc, c_cfg)
-            if not prompts:
-                print(f"[{c_name}] No pending prompts")
-                continue
-
-            send_telegram(f"[{c_name}] Pipeline started: {len(prompts)} video(s) (parallel)")
-
             results_folder_id = c_cfg["results_folder_id"]
             part2_file_id = c_cfg["part2_file_id"]
 
@@ -716,107 +709,127 @@ def generate_and_process(country=None):
             reencode_video(local_part2, local_part2_clean)
             print(f"  [{c_name}] Part2 ready")
 
-            # Video numbering
             master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
-            today_prefix = f"{date_du_jour}_V"
-            existing_rows = master_ws.get_all_values()
-            existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-            vid_index = existing_today + 1
+            batch_num = 0
 
-            # ── STEP 1: Fire ALL generation requests at once ──
-            tasks = []
-            for p_data in prompts:
-                try:
-                    task_id = kie_generate_video(p_data["prompt"])
-                    tasks.append({
-                        "task_id": task_id,
-                        "prompt_data": p_data,
-                        "vid_index": vid_index,
-                        "status": "generating",
-                        "video_url": None,
-                        "elapsed": 0,
-                    })
-                    vid_index += 1
-                except Exception as e:
-                    total_errors += 1
-                    print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
-                    send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
+            # ── BATCH LOOP: process all prompts in batches of MAX_VIDEOS_PER_RUN ──
+            while True:
+                batch_num += 1
+                prompts = get_prompts_for_country(gc, c_cfg)
+                if not prompts:
+                    if batch_num == 1:
+                        print(f"[{c_name}] No pending prompts")
+                    else:
+                        print(f"[{c_name}] No more prompts after batch {batch_num - 1}")
+                    break
 
-            if not tasks:
-                continue
+                send_telegram(
+                    f"[{c_name}] Batch {batch_num}: {len(prompts)} video(s) (parallel)"
+                )
 
-            print(f"  [{c_name}] {len(tasks)} generation(s) submitted in parallel")
+                # Video numbering: re-count each batch to stay accurate
+                today_prefix = f"{date_du_jour}_V"
+                existing_rows = master_ws.get_all_values()
+                existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
+                vid_index = existing_today + 1
 
-            # ── STEP 2: Poll loop — check all pending, edit as soon as ready ──
-            max_wait = 600
-            interval = 15
-
-            while any(t["status"] == "generating" for t in tasks):
-                time.sleep(interval)
-
-                for task in tasks:
-                    if task["status"] != "generating":
-                        continue
-
-                    task["elapsed"] += interval
-                    task_id = task["task_id"]
-
+                # ── Fire ALL generation requests for this batch ──
+                tasks = []
+                for p_data in prompts:
                     try:
-                        resp = http_requests.get(
-                            f"{KIE_API_BASE}/api/v1/veo/record-info",
-                            headers=KIE_HEADERS,
-                            params={"taskId": task_id},
-                            timeout=30,
-                        )
-                        data = resp.json()
-                        if data.get("code") != 200:
-                            print(f"  kie.ai poll error for {task_id}: {data.get('msg', '')}")
+                        task_id = kie_generate_video(p_data["prompt"])
+                        tasks.append({
+                            "task_id": task_id,
+                            "prompt_data": p_data,
+                            "vid_index": vid_index,
+                            "status": "generating",
+                            "video_url": None,
+                            "elapsed": 0,
+                        })
+                        vid_index += 1
+                    except Exception as e:
+                        total_errors += 1
+                        print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
+                        send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
+
+                if not tasks:
+                    break
+
+                print(f"  [{c_name}] Batch {batch_num}: {len(tasks)} generation(s) submitted")
+
+                # ── Poll loop — check all pending, edit as soon as ready ──
+                max_wait = 600
+                interval = 15
+
+                while any(t["status"] == "generating" for t in tasks):
+                    time.sleep(interval)
+
+                    for task in tasks:
+                        if task["status"] != "generating":
                             continue
 
-                        flag = data["data"].get("successFlag", 0)
+                        task["elapsed"] += interval
+                        task_id = task["task_id"]
 
-                        if flag == 1:
-                            urls = data["data"].get("response", {}).get("resultUrls", [])
-                            if not urls:
-                                task["status"] = "failed"
-                                total_errors += 1
-                                print(f"  [{c_name}] V{task['vid_index']}: success but no URL")
+                        try:
+                            resp = http_requests.get(
+                                f"{KIE_API_BASE}/api/v1/veo/record-info",
+                                headers=KIE_HEADERS,
+                                params={"taskId": task_id},
+                                timeout=30,
+                            )
+                            data = resp.json()
+                            if data.get("code") != 200:
+                                print(f"  kie.ai poll error for {task_id}: {data.get('msg', '')}")
                                 continue
 
-                            task["video_url"] = urls[0]
-                            task["status"] = "ready"
-                            print(f"  [{c_name}] V{task['vid_index']} ready! Editing now...")
+                            flag = data["data"].get("successFlag", 0)
 
-                            ok = process_ready_video(
-                                task, drive_service, gc, c_name, c_cfg,
-                                local_part2_clean, edited_folder_id, original_folder_id,
-                                master_ws, date_du_jour,
-                            )
-                            task["status"] = "done" if ok else "failed"
-                            if ok:
-                                total_success += 1
-                            else:
+                            if flag == 1:
+                                urls = data["data"].get("response", {}).get("resultUrls", [])
+                                if not urls:
+                                    task["status"] = "failed"
+                                    total_errors += 1
+                                    print(f"  [{c_name}] V{task['vid_index']}: success but no URL")
+                                    continue
+
+                                task["video_url"] = urls[0]
+                                task["status"] = "ready"
+                                print(f"  [{c_name}] V{task['vid_index']} ready! Editing now...")
+
+                                ok = process_ready_video(
+                                    task, drive_service, gc, c_name, c_cfg,
+                                    local_part2_clean, edited_folder_id, original_folder_id,
+                                    master_ws, date_du_jour,
+                                )
+                                task["status"] = "done" if ok else "failed"
+                                if ok:
+                                    total_success += 1
+                                else:
+                                    total_errors += 1
+
+                            elif flag in (2, 3):
+                                err = data["data"].get("errorMessage", "unknown")
+                                task["status"] = "failed"
                                 total_errors += 1
+                                print(f"  [{c_name}] V{task['vid_index']} generation failed: {err}")
+                                send_telegram(f"[{c_name}] V{task['vid_index']} failed: {err[:100]}")
 
-                        elif flag in (2, 3):
-                            err = data["data"].get("errorMessage", "unknown")
+                        except Exception as e:
+                            print(f"  [{c_name}] Poll error V{task['vid_index']}: {e}")
+
+                        if task["status"] == "generating" and task["elapsed"] >= max_wait:
                             task["status"] = "failed"
                             total_errors += 1
-                            print(f"  [{c_name}] V{task['vid_index']} generation failed: {err}")
-                            send_telegram(f"[{c_name}] V{task['vid_index']} failed: {err[:100]}")
+                            print(f"  [{c_name}] V{task['vid_index']} timed out after {max_wait}s")
+                            send_telegram(f"[{c_name}] V{task['vid_index']} timed out")
 
-                    except Exception as e:
-                        print(f"  [{c_name}] Poll error V{task['vid_index']}: {e}")
+                    pending = sum(1 for t in tasks if t["status"] == "generating")
+                    if pending > 0:
+                        print(f"  [{c_name}] {pending} still generating...")
 
-                    if task["status"] == "generating" and task["elapsed"] >= max_wait:
-                        task["status"] = "failed"
-                        total_errors += 1
-                        print(f"  [{c_name}] V{task['vid_index']} timed out after {max_wait}s")
-                        send_telegram(f"[{c_name}] V{task['vid_index']} timed out")
-
-                pending = sum(1 for t in tasks if t["status"] == "generating")
-                if pending > 0:
-                    print(f"  [{c_name}] {pending} still generating...")
+                batch_ok = sum(1 for t in tasks if t["status"] == "done")
+                print(f"  [{c_name}] Batch {batch_num} complete: {batch_ok}/{len(tasks)} OK")
 
             # Cleanup Part2
             for p in [local_part2, local_part2_clean]:

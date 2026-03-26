@@ -3,6 +3,7 @@ import io
 import datetime
 import subprocess
 import time
+import threading
 import openai
 import gspread
 import requests as http_requests
@@ -858,6 +859,47 @@ def generate_and_process(country=None):
         is_generating = False
 
 # ============================================================
+# CRON — check sheet every 60s, auto-launch if prompts found
+# ============================================================
+CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "60"))
+cron_enabled = os.environ.get("CRON_ENABLED", "true").lower() == "true"
+
+def has_pending_prompts():
+    """Quick check: are there any non-done prompts in any country tab?"""
+    try:
+        _, gc = get_google_services()
+        for c_cfg in COUNTRY_CONFIG.values():
+            prompts = get_prompts_for_country(gc, c_cfg, limit=1)
+            if prompts:
+                return True
+    except Exception as e:
+        print(f"  Cron check error: {e}")
+    return False
+
+def cron_loop():
+    """Background thread that checks for new prompts and auto-launches."""
+    print(f"Cron started (interval={CRON_INTERVAL}s)")
+    while True:
+        time.sleep(CRON_INTERVAL)
+        if is_generating:
+            continue
+        try:
+            if has_pending_prompts():
+                print("Cron: pending prompts found, launching pipeline...")
+                generate_and_process()
+        except Exception as e:
+            print(f"Cron error: {e}")
+
+@app.on_event("startup")
+def start_cron():
+    if cron_enabled:
+        t = threading.Thread(target=cron_loop, daemon=True)
+        t.start()
+        print(f"Cron thread started (every {CRON_INTERVAL}s)")
+    else:
+        print("Cron disabled (CRON_ENABLED=false)")
+
+# ============================================================
 # ENDPOINTS
 # ============================================================
 @app.get("/")
@@ -865,6 +907,8 @@ def root():
     return {
         "status": "Video Editor Server running",
         "generating": is_generating,
+        "cron_enabled": cron_enabled,
+        "cron_interval_s": CRON_INTERVAL,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
 
@@ -872,6 +916,7 @@ def root():
 def status():
     return {
         "generating": is_generating,
+        "cron_enabled": cron_enabled,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
 
@@ -881,6 +926,7 @@ def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
     Full pipeline: read prompts -> generate via kie.ai -> edit -> upload to RESULTS.
     - No param: all countries.
     - country=UK: UK only.
+    Also triggered automatically by cron every 60s.
     """
     global is_generating
     if is_generating:

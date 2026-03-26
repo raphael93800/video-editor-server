@@ -952,6 +952,85 @@ def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
         "message": f"Generation + editing started ({target})",
     })
 
+@app.get("/debug")
+def debug_state():
+    """Diagnostic: list what's in RESULTS folders and prompt sheet status."""
+    try:
+        drive_service, gc = get_google_services()
+        result = {}
+
+        for c_name, c_cfg in COUNTRY_CONFIG.items():
+            country_info = {}
+
+            # List RESULTS/<country> subfolders and files
+            results_id = c_cfg["results_folder_id"]
+            q = f"'{results_id}' in parents and trashed = false"
+            resp = drive_service.files().list(
+                q=q, fields="files(id, name, mimeType)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True
+            ).execute()
+            date_folders = resp.get("files", [])
+            folders_info = {}
+            for df in date_folders:
+                if df["mimeType"] == "application/vnd.google-apps.folder":
+                    sub_q = f"'{df['id']}' in parents and trashed = false"
+                    sub_resp = drive_service.files().list(
+                        q=sub_q, fields="files(id, name, mimeType)",
+                        supportsAllDrives=True, includeItemsFromAllDrives=True
+                    ).execute()
+                    sub_files = sub_resp.get("files", [])
+                    sub_info = {}
+                    for sf in sub_files:
+                        if sf["mimeType"] == "application/vnd.google-apps.folder":
+                            inner_q = f"'{sf['id']}' in parents and trashed = false"
+                            inner_resp = drive_service.files().list(
+                                q=inner_q, fields="files(id, name)",
+                                supportsAllDrives=True, includeItemsFromAllDrives=True
+                            ).execute()
+                            inner_files = inner_resp.get("files", [])
+                            sub_info[sf["name"]] = {
+                                "count": len(inner_files),
+                                "files": [f["name"] for f in sorted(inner_files, key=lambda x: x["name"])]
+                            }
+                    folders_info[df["name"]] = sub_info
+            country_info["results_folders"] = folders_info
+
+            # Prompt sheet status
+            try:
+                ss = gc.open_by_key(PROMPTS_SHEET_ID)
+                ws = ss.worksheet(c_cfg["prompt_tab"])
+                all_rows = ws.get_all_values()
+                headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
+                status_idx = headers.index("status") if "status" in headers else -1
+                prompt_idx = headers.index("prompt") if "prompt" in headers else -1
+                done = 0
+                not_done = 0
+                for r in all_rows[1:]:
+                    has_prompt = prompt_idx >= 0 and prompt_idx < len(r) and r[prompt_idx].strip()
+                    is_done = status_idx >= 0 and status_idx < len(r) and r[status_idx].strip().lower() == "done"
+                    if has_prompt:
+                        if is_done:
+                            done += 1
+                        else:
+                            not_done += 1
+                country_info["prompts"] = {"total": done + not_done, "done": done, "pending": not_done}
+            except Exception as e:
+                country_info["prompts"] = {"error": str(e)}
+
+            # Master sheet row count
+            try:
+                master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+                master_rows = master_ws.get_all_values()
+                country_info["master_sheet_rows"] = len(master_rows) - 1
+            except Exception as e:
+                country_info["master_sheet_rows"] = {"error": str(e)}
+
+            result[c_name] = country_info
+
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

@@ -716,7 +716,9 @@ def generate_and_process(country=None):
             # ── BATCH LOOP: process all prompts in batches of MAX_VIDEOS_PER_RUN ──
             while True:
                 batch_num += 1
-                prompts = get_prompts_for_country(gc, c_cfg)
+                # Re-auth to avoid gspread cache returning stale data
+                _, gc_fresh = get_google_services()
+                prompts = get_prompts_for_country(gc_fresh, c_cfg)
                 if not prompts:
                     if batch_num == 1:
                         print(f"[{c_name}] No pending prompts")
@@ -728,7 +730,8 @@ def generate_and_process(country=None):
                     f"[{c_name}] Batch {batch_num}: {len(prompts)} video(s) (parallel)"
                 )
 
-                # Video numbering: re-count each batch to stay accurate
+                # Refresh master worksheet to get accurate row count
+                master_ws = get_or_create_master_tab(gc_fresh, c_cfg["master_tab"])
                 today_prefix = f"{date_du_jour}_V"
                 existing_rows = master_ws.get_all_values()
                 existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0

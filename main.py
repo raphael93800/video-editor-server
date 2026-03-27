@@ -1000,6 +1000,207 @@ def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
         "message": f"Continuous pipeline started ({target})",
     })
 
+@app.post("/reedit")
+def trigger_reedit(background_tasks: BackgroundTasks, country: str = "USA", date: str = None):
+    """
+    Re-edit originals that are in Drive but not yet edited.
+    No kie.ai calls, no cost — just FFmpeg editing of existing files.
+    """
+    global is_generating
+    if is_generating:
+        return JSONResponse({"status": "already_running", "message": "A pipeline is already in progress"})
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    if not date:
+        date = datetime.datetime.now().strftime("%d.%m")
+    is_generating = True
+    background_tasks.add_task(reedit_originals, c, date)
+    return JSONResponse({"status": "started", "message": f"Re-editing unedited originals for {c} / {date}"})
+
+
+def reedit_originals(country, date_str):
+    """
+    Find originals in RESULTS/<country>/<date>/original/ that don't have
+    a matching edited video, then edit them using metadata from the prompt sheet.
+    """
+    global is_generating
+    c_cfg = COUNTRY_CONFIG[country]
+
+    try:
+        drive_service, gc = get_google_services()
+        results_folder_id = c_cfg["results_folder_id"]
+
+        # Find the date folder
+        q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date_str}'"
+        resp = drive_service.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        date_folders = resp.get("files", [])
+        if not date_folders:
+            print(f"[reedit] No folder {date_str} found in RESULTS/{country}")
+            send_telegram(f"[{country}] Reedit: no folder {date_str}")
+            return
+        date_folder_id = date_folders[0]["id"]
+
+        # Find original/ and edited/ subfolders
+        original_folder_id = None
+        edited_folder_id = None
+        q2 = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+        resp2 = drive_service.files().list(q=q2, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        for f in resp2.get("files", []):
+            if f["name"] == "original":
+                original_folder_id = f["id"]
+            elif f["name"] == "edited":
+                edited_folder_id = f["id"]
+
+        if not original_folder_id or not edited_folder_id:
+            print(f"[reedit] Missing original/ or edited/ in {date_str}")
+            send_telegram(f"[{country}] Reedit: missing subfolders in {date_str}")
+            return
+
+        # List originals
+        q3 = f"'{original_folder_id}' in parents and trashed=false"
+        resp3 = drive_service.files().list(q=q3, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute()
+        originals = resp3.get("files", [])
+
+        # List already edited
+        q4 = f"'{edited_folder_id}' in parents and trashed=false"
+        resp4 = drive_service.files().list(q=q4, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute()
+        edited_names = {f["name"] for f in resp4.get("files", [])}
+        edited_count = len(edited_names)
+
+        # Get metadata from done prompts in the sheet
+        _, gc2 = get_google_services()
+        ss = gc2.open_by_key(PROMPTS_SHEET_ID)
+        ws = ss.worksheet(c_cfg["prompt_tab"])
+        all_rows = ws.get_all_values()
+        headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
+        done_prompts = []
+        for row in all_rows[1:]:
+            row_dict = {}
+            for h_idx, h in enumerate(headers):
+                row_dict[h] = row[h_idx].strip() if h_idx < len(row) else ""
+            if row_dict.get("status", "").lower() == "done" and row_dict.get("prompt", ""):
+                done_prompts.append({
+                    "title_of_video": row_dict.get("title of video", ""),
+                    "headline_meta": row_dict.get("headline meta", ""),
+                    "primary_text": row_dict.get("primary text", ""),
+                    "prompt": row_dict.get("prompt", ""),
+                })
+
+        # Download and prepare Part2
+        local_part2 = f"/tmp/part2_reedit_{country}.mp4"
+        local_part2_clean = f"/tmp/part2_reedit_clean_{country}.mp4"
+        for p in [local_part2, local_part2_clean]:
+            if os.path.exists(p):
+                os.remove(p)
+        drive_download_file(drive_service, c_cfg["part2_file_id"], local_part2)
+        reencode_video(local_part2, local_part2_clean)
+
+        # Sort originals by name for consistent ordering
+        originals_sorted = sorted(originals, key=lambda x: x["name"])
+
+        vid_index = edited_count + 1
+        success = 0
+        errors = 0
+        to_edit = []
+
+        for orig in originals_sorted:
+            nom_final = f"{date_str}_V{vid_index}.mp4"
+            if nom_final in edited_names:
+                vid_index += 1
+                continue
+            to_edit.append((orig, vid_index))
+            vid_index += 1
+
+        if not to_edit:
+            send_telegram(f"[{country}] Reedit: nothing to do, all originals already edited")
+            return
+
+        send_telegram(f"[{country}] Reedit: {len(to_edit)} videos to edit from {date_str}/original/")
+
+        for i, (orig, v_idx) in enumerate(to_edit):
+            nom_final = f"{date_str}_V{v_idx}.mp4"
+            local_raw = f"/tmp/reedit_{country}_{v_idx}.mp4"
+            local_edited = None
+
+            # Pick metadata: cycle through done_prompts if we have them
+            if done_prompts:
+                meta_src = done_prompts[i % len(done_prompts)]
+            else:
+                meta_src = {"title_of_video": DEFAULT_TITLE, "headline_meta": "", "primary_text": "", "prompt": ""}
+
+            try:
+                drive_download_file(drive_service, orig["id"], local_raw)
+
+                edit_semaphore.acquire()
+                try:
+                    metadata = {
+                        "title": meta_src["title_of_video"] or DEFAULT_TITLE,
+                        "headline": meta_src["headline_meta"],
+                        "primary_text": meta_src["primary_text"],
+                        "prompt": meta_src["prompt"],
+                    }
+                    local_edited = edit_single_video(local_raw, local_part2_clean, metadata, country, v_idx)
+                finally:
+                    edit_semaphore.release()
+
+                out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
+                print(f"  [{country}] Reedit V{v_idx} done: {nom_final}")
+
+                # Log in Master Sheet
+                version = ((v_idx - 1) // VIDEOS_PER_CAMPAIGN) + 1
+                campaign_name = f"C{date_str}_{country}_{version:02d}"
+                adset_name = f"adset{version}_{country}_{date_str}"
+                drive_link, direct_link = make_drive_links(out_id)
+                with sheet_lock:
+                    _, gc_t = get_google_services()
+                    master_ws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
+                    master_ws.append_row(
+                        [nom_final.replace(".mp4", ""), drive_link, direct_link,
+                         campaign_name, adset_name,
+                         meta_src["primary_text"], meta_src["headline_meta"], meta_src["prompt"]],
+                        value_input_option="USER_ENTERED"
+                    )
+
+                success += 1
+
+            except Exception as e:
+                errors += 1
+                print(f"  [{country}] Reedit V{v_idx} ERROR: {e}")
+                send_telegram(f"[{country}] Reedit V{v_idx} error: {str(e)[:150]}")
+
+            finally:
+                for tmp in [local_raw]:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except:
+                        pass
+                if local_edited:
+                    try:
+                        if os.path.exists(local_edited):
+                            os.remove(local_edited)
+                    except:
+                        pass
+
+        for p in [local_part2, local_part2_clean]:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
+
+        send_telegram(f"[{country}] Reedit complete: {success}/{len(to_edit)} OK, {errors} errors")
+
+    except Exception as e:
+        send_telegram(f"[{country}] Reedit critical error: {str(e)[:200]}")
+        print(f"Reedit critical error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        is_generating = False
+
+
 @app.get("/debug")
 def debug_state():
     """Diagnostic: list what's in RESULTS folders and prompt sheet status."""

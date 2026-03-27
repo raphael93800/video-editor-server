@@ -1262,14 +1262,16 @@ def reedit_originals(country, date_str):
             local_raw = f"/tmp/reedit_{country}_{v_idx}.mp4"
             local_edited = None
 
-            # Pick metadata: cycle through done_prompts if we have them
             if done_prompts:
                 meta_src = done_prompts[i % len(done_prompts)]
             else:
                 meta_src = {"title_of_video": DEFAULT_TITLE, "headline_meta": "", "primary_text": "", "prompt": ""}
 
             try:
-                drive_download_file(drive_service, orig["id"], local_raw)
+                # Fresh Drive client each video to avoid token expiry
+                drive_svc, _ = get_google_services()
+
+                drive_download_file(drive_svc, orig["id"], local_raw)
 
                 edit_semaphore.acquire()
                 try:
@@ -1284,12 +1286,11 @@ def reedit_originals(country, date_str):
                     edit_semaphore.release()
 
                 if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
-                    raise Exception(f"Edited file missing or too small ({os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0} bytes)")
+                    raise Exception(f"Edited file missing or too small")
 
-                out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
-                print(f"  [{country}] Reedit V{v_idx} done: {nom_final}")
+                out_id = drive_upload_video(drive_svc, local_edited, edited_folder_id, nom_final)
+                print(f"  [{country}] Reedit V{v_idx} done ({i+1}/{len(to_edit)})")
 
-                # Log in Master Sheet
                 version = ((v_idx - 1) // VIDEOS_PER_CAMPAIGN) + 1
                 campaign_name = f"C{date_str}_{country}_{version:02d}"
                 adset_name = f"adset{version}_{country}_{date_str}"
@@ -1309,7 +1310,10 @@ def reedit_originals(country, date_str):
             except Exception as e:
                 errors += 1
                 print(f"  [{country}] Reedit V{v_idx} ERROR: {e}")
-                send_telegram(f"[{country}] Reedit V{v_idx} error: {str(e)[:150]}")
+                import traceback
+                traceback.print_exc()
+                # Keep going, don't stop the whole batch
+                continue
 
             finally:
                 for tmp in [local_raw]:

@@ -578,7 +578,7 @@ def mark_prompt_done(gc, country_cfg, row_index):
 # threaded editing, auto-backfill from prompt queue
 # ============================================================
 sheet_lock = threading.Lock()
-edit_semaphore = threading.Semaphore(2)
+edit_semaphore = threading.Semaphore(1)
 
 def process_ready_video_thread(task, drive_service, c_name, c_cfg,
                                local_part2_clean, edited_folder_id, original_folder_id,
@@ -627,6 +627,9 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
             )
         finally:
             edit_semaphore.release()
+
+        if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
+            raise Exception(f"Edited file missing or too small ({os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0} bytes)")
 
         out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
         print(f"  [{c_name}] Edited uploaded: {nom_final}")
@@ -1197,6 +1200,9 @@ def reedit_originals(country, date_str):
                     local_edited = edit_single_video(local_raw, local_part2_clean, metadata, country, v_idx)
                 finally:
                     edit_semaphore.release()
+
+                if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
+                    raise Exception(f"Edited file missing or too small ({os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0} bytes)")
 
                 out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
                 print(f"  [{country}] Reedit V{v_idx} done: {nom_final}")

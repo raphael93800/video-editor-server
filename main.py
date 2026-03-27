@@ -1243,18 +1243,13 @@ def reedit_originals(country, date_str):
         # Sort originals by name for consistent ordering
         originals_sorted = sorted(originals, key=lambda x: x["name"])
 
+        # Find which originals are already edited by matching original IDs we've seen
+        # Simple approach: if we have N edited files, skip the first N originals
+        originals_to_edit = originals_sorted[edited_count:]
         vid_index = edited_count + 1
         success = 0
         errors = 0
-        to_edit = []
-
-        for orig in originals_sorted:
-            nom_final = f"{date_str}_V{vid_index}.mp4"
-            if nom_final in edited_names:
-                vid_index += 1
-                continue
-            to_edit.append((orig, vid_index))
-            vid_index += 1
+        to_edit = [(orig, vid_index + i) for i, orig in enumerate(originals_to_edit)]
 
         if not to_edit:
             send_telegram(f"[{country}] Reedit: nothing to do, all originals already edited")

@@ -68,6 +68,7 @@ MASTER_SHEET_HEADERS = [
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
 is_generating = False
+is_reediting = False
 
 # ============================================================
 # GOOGLE AUTH
@@ -972,34 +973,35 @@ def cron_loop():
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
         time.sleep(CRON_INTERVAL)
-        if is_generating:
-            print("Cron: skipping, pipeline already running")
-            continue
         try:
-            # Priority 1: generate new videos from pending prompts
-            print("Cron: checking for pending prompts...")
-            if has_pending_prompts():
-                print("Cron: pending prompts found, launching pipeline...")
-                is_generating = True
-                generate_and_process()
-                continue
-
-            # Priority 2: re-edit originals that failed editing
-            print("Cron: checking for unedited originals...")
-            result = has_unedited_originals()
-            if result:
-                c_name, date_str = result
-                print(f"Cron: found unedited originals for {c_name}/{date_str}, launching reedit...")
-                is_generating = True
-                reedit_originals(c_name, date_str)
+            # Task 1: generate new videos from pending prompts
+            if not is_generating:
+                print("Cron: checking for pending prompts...")
+                if has_pending_prompts():
+                    print("Cron: pending prompts found, launching pipeline...")
+                    is_generating = True
+                    threading.Thread(target=generate_and_process, daemon=True).start()
             else:
-                print("Cron: nothing to do")
+                print("Cron: generation already running")
+
+            # Task 2: re-edit originals that failed (runs independently)
+            if not is_reediting:
+                print("Cron: checking for unedited originals...")
+                result = has_unedited_originals()
+                if result:
+                    c_name, date_str = result
+                    print(f"Cron: found unedited originals for {c_name}/{date_str}, launching reedit...")
+                    is_reediting = True
+                    threading.Thread(target=reedit_originals, args=(c_name, date_str), daemon=True).start()
+                else:
+                    print("Cron: no unedited originals")
+            else:
+                print("Cron: reedit already running")
 
         except Exception as e:
             print(f"Cron error: {e}")
             import traceback
             traceback.print_exc()
-            is_generating = False
 
 @app.on_event("startup")
 def start_cron():
@@ -1027,6 +1029,7 @@ def root():
 def status():
     return {
         "generating": is_generating,
+        "reediting": is_reediting,
         "cron_enabled": cron_enabled,
         "countries": list(COUNTRY_CONFIG.keys()),
     }
@@ -1143,16 +1146,17 @@ def trigger_reedit(background_tasks: BackgroundTasks, country: str = "USA", date
     """
     Re-edit originals that are in Drive but not yet edited.
     No kie.ai calls, no cost — just FFmpeg editing of existing files.
+    Runs independently of generate pipeline.
     """
-    global is_generating
-    if is_generating:
-        return JSONResponse({"status": "already_running", "message": "A pipeline is already in progress"})
+    global is_reediting
+    if is_reediting:
+        return JSONResponse({"status": "already_running", "message": "A reedit is already in progress"})
     c = country.upper()
     if c not in COUNTRY_CONFIG:
         return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
     if not date:
         date = datetime.datetime.now().strftime("%d.%m")
-    is_generating = True
+    is_reediting = True
     background_tasks.add_task(reedit_originals, c, date)
     return JSONResponse({"status": "started", "message": f"Re-editing unedited originals for {c} / {date}"})
 
@@ -1162,7 +1166,7 @@ def reedit_originals(country, date_str):
     Find originals in RESULTS/<country>/<date>/original/ that don't have
     a matching edited video, then edit them using metadata from the prompt sheet.
     """
-    global is_generating
+    global is_reediting
     c_cfg = COUNTRY_CONFIG[country]
 
     try:
@@ -1339,7 +1343,7 @@ def reedit_originals(country, date_str):
         import traceback
         traceback.print_exc()
     finally:
-        is_generating = False
+        is_reediting = False
 
 
 @app.get("/debug")

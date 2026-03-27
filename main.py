@@ -918,8 +918,50 @@ def has_pending_prompts():
         traceback.print_exc()
     return False
 
+def has_unedited_originals():
+    """Check if any country has originals in today's folder without matching edited files."""
+    try:
+        drive_service, _ = get_google_services()
+        date_str = datetime.datetime.now().strftime("%d.%m")
+
+        for c_name, c_cfg in COUNTRY_CONFIG.items():
+            results_id = c_cfg["results_folder_id"]
+            q = f"'{results_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date_str}'"
+            resp = drive_service.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+            date_folders = resp.get("files", [])
+            if not date_folders:
+                continue
+
+            date_folder_id = date_folders[0]["id"]
+            sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+            sub_resp = drive_service.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+            orig_id = None
+            edit_id = None
+            for f in sub_resp.get("files", []):
+                if f["name"] == "original":
+                    orig_id = f["id"]
+                elif f["name"] == "edited":
+                    edit_id = f["id"]
+
+            if not orig_id or not edit_id:
+                continue
+
+            orig_q = f"'{orig_id}' in parents and trashed=false"
+            orig_count = len(drive_service.files().list(q=orig_q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", []))
+            edit_q = f"'{edit_id}' in parents and trashed=false"
+            edit_count = len(drive_service.files().list(q=edit_q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", []))
+
+            if orig_count > edit_count:
+                print(f"  Cron: {c_name} {date_str} has {orig_count} originals but only {edit_count} edited")
+                return c_name, date_str
+
+    except Exception as e:
+        print(f"  Cron unedited check error: {e}")
+    return None
+
+
 def cron_loop():
-    """Background thread that checks for new prompts and auto-launches."""
+    """Background thread: auto-generate new videos AND auto-reedit failed ones."""
     global is_generating
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
@@ -928,13 +970,25 @@ def cron_loop():
             print("Cron: skipping, pipeline already running")
             continue
         try:
+            # Priority 1: generate new videos from pending prompts
             print("Cron: checking for pending prompts...")
             if has_pending_prompts():
                 print("Cron: pending prompts found, launching pipeline...")
                 is_generating = True
                 generate_and_process()
+                continue
+
+            # Priority 2: re-edit originals that failed editing
+            print("Cron: checking for unedited originals...")
+            result = has_unedited_originals()
+            if result:
+                c_name, date_str = result
+                print(f"Cron: found unedited originals for {c_name}/{date_str}, launching reedit...")
+                is_generating = True
+                reedit_originals(c_name, date_str)
             else:
-                print("Cron: no pending prompts")
+                print("Cron: nothing to do")
+
         except Exception as e:
             print(f"Cron error: {e}")
             import traceback

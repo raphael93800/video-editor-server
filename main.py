@@ -1060,6 +1060,84 @@ def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
         "message": f"Continuous pipeline started ({target})",
     })
 
+@app.post("/test-edit")
+def test_edit_one(country: str = "USA", date: str = None):
+    """Synchronously try to edit ONE original and return the exact error or success."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return {"error": f"Unknown country: {c}"}
+    c_cfg = COUNTRY_CONFIG[c]
+    if not date:
+        date = datetime.datetime.now().strftime("%d.%m")
+
+    try:
+        drive_service, gc = get_google_services()
+        results_id = c_cfg["results_folder_id"]
+
+        q = f"'{results_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date}'"
+        resp = drive_service.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        date_folders = resp.get("files", [])
+        if not date_folders:
+            return {"error": f"No folder {date}"}
+
+        date_folder_id = date_folders[0]["id"]
+        sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+        sub_resp = drive_service.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        orig_id = None
+        for f in sub_resp.get("files", []):
+            if f["name"] == "original":
+                orig_id = f["id"]
+
+        if not orig_id:
+            return {"error": "No original/ folder"}
+
+        orig_q = f"'{orig_id}' in parents and trashed=false"
+        originals = drive_service.files().list(q=orig_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1).execute().get("files", [])
+        if not originals:
+            return {"error": "No originals found"}
+
+        test_file = originals[0]
+        local_raw = f"/tmp/test_edit_raw.mp4"
+        local_part2 = f"/tmp/test_part2.mp4"
+        local_part2_clean = f"/tmp/test_part2_clean.mp4"
+
+        drive_download_file(drive_service, test_file["id"], local_raw)
+        raw_size = os.path.getsize(local_raw)
+        raw_duration = get_video_duration(local_raw)
+        has_video = has_video_stream(local_raw)
+
+        drive_download_file(drive_service, c_cfg["part2_file_id"], local_part2)
+        reencode_video(local_part2, local_part2_clean)
+
+        metadata = {"title": DEFAULT_TITLE, "headline": "", "primary_text": "", "prompt": "test"}
+        local_edited = edit_single_video(local_raw, local_part2_clean, metadata, c, 9999)
+
+        edited_size = os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0
+        edited_duration = get_video_duration(local_edited) if edited_size > 0 else 0
+
+        # Cleanup
+        for p in [local_raw, local_part2, local_part2_clean, local_edited]:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
+
+        return {
+            "status": "success",
+            "original": test_file["name"],
+            "raw_size_mb": round(raw_size / 1024 / 1024, 2),
+            "raw_duration": round(raw_duration, 2),
+            "has_video": has_video,
+            "edited_size_mb": round(edited_size / 1024 / 1024, 2),
+            "edited_duration": round(edited_duration, 2),
+        }
+
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.post("/reedit")
 def trigger_reedit(background_tasks: BackgroundTasks, country: str = "USA", date: str = None):
     """

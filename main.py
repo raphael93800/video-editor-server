@@ -974,17 +974,7 @@ def cron_loop():
     while True:
         time.sleep(CRON_INTERVAL)
         try:
-            # Task 1: generate new videos from pending prompts
-            if not is_generating:
-                print("Cron: checking for pending prompts...")
-                if has_pending_prompts():
-                    print("Cron: pending prompts found, launching pipeline...")
-                    is_generating = True
-                    threading.Thread(target=generate_and_process, daemon=True).start()
-            else:
-                print("Cron: generation already running")
-
-            # Task 2: re-edit originals that failed (runs independently)
+            # Priority 1: ALWAYS reedit failed originals first
             if not is_reediting:
                 print("Cron: checking for unedited originals...")
                 result = has_unedited_originals()
@@ -992,11 +982,23 @@ def cron_loop():
                     c_name, date_str = result
                     print(f"Cron: found unedited originals for {c_name}/{date_str}, launching reedit...")
                     is_reediting = True
-                    threading.Thread(target=reedit_originals, args=(c_name, date_str), daemon=True).start()
+                    reedit_originals(c_name, date_str)
+                    continue
                 else:
                     print("Cron: no unedited originals")
             else:
-                print("Cron: reedit already running")
+                print("Cron: reedit already running, skipping generation")
+                continue
+
+            # Priority 2: only generate new videos if nothing to reedit
+            if not is_generating:
+                print("Cron: checking for pending prompts...")
+                if has_pending_prompts():
+                    print("Cron: pending prompts found, launching pipeline...")
+                    is_generating = True
+                    generate_and_process()
+            else:
+                print("Cron: generation already running")
 
         except Exception as e:
             print(f"Cron error: {e}")

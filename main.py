@@ -1289,7 +1289,11 @@ def reedit_originals(country, date_str):
                                 break
                             except Exception as se:
                                 print(f"  Sheet write retry {attempt+1}: {se}")
-                                time.sleep(5)
+                                if attempt < 2:
+                                    time.sleep(5)
+                                else:
+                                    print(f"  [{country}] SHEET WRITE FAILED for V{v_idx} after 3 attempts")
+                                    send_telegram(f"[{country}] Sheet write FAILED for V{v_idx}: {str(se)[:100]}")
 
                         total_success += 1
                         if total_success % 10 == 0:
@@ -1406,6 +1410,120 @@ def debug_state():
         return result
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/fix-sheet")
+def fix_sheet(country: str = "USA", date: str = None):
+    """
+    Sync Master Sheet with Drive: add rows for edited videos that are missing from the sheet.
+    Compares edited/ folder contents with Ad_Name column in Master Sheet.
+    """
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    if not date:
+        date = datetime.datetime.now().strftime("%d.%m")
+
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        drive_svc, gc = get_google_services()
+        results_folder_id = c_cfg["results_folder_id"]
+
+        q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date}'"
+        date_folders = drive_svc.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+        if not date_folders:
+            return {"status": "error", "message": f"No folder {date} in RESULTS/{c}"}
+        date_folder_id = date_folders[0]["id"]
+
+        sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+        subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+        edit_folder_id = next((f["id"] for f in subs if f["name"] == "edited"), None)
+        if not edit_folder_id:
+            return {"status": "error", "message": "No edited/ folder found"}
+
+        edited_files = drive_svc.files().list(
+            q=f"'{edit_folder_id}' in parents and trashed=false",
+            fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+        ).execute().get("files", [])
+
+        master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        existing_rows = master_ws.get_all_values()
+        existing_names = set()
+        if existing_rows:
+            for row in existing_rows[1:]:
+                if row:
+                    existing_names.add(row[0].strip())
+
+        # Get metadata from prompts sheet
+        try:
+            ss = gc.open_by_key(PROMPTS_SHEET_ID)
+            ws = ss.worksheet(c_cfg["prompt_tab"])
+            all_rows = ws.get_all_values()
+            headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
+            done_prompts = []
+            for row in all_rows[1:]:
+                rd = {h: (row[hi].strip() if hi < len(row) else "") for hi, h in enumerate(headers)}
+                if rd.get("status", "").lower() == "done" and rd.get("prompt", ""):
+                    done_prompts.append(rd)
+        except:
+            done_prompts = []
+
+        added = 0
+        skipped = 0
+        edited_sorted = sorted(edited_files, key=lambda x: x["name"])
+
+        for i, ef in enumerate(edited_sorted):
+            ad_name = ef["name"].replace(".mp4", "")
+            if ad_name in existing_names:
+                skipped += 1
+                continue
+
+            file_id = ef["id"]
+            drive_link, direct_link = make_drive_links(file_id)
+
+            # Extract version number from filename (e.g. 27.03_V55 -> 55)
+            try:
+                v_num = int(ad_name.split("_V")[-1])
+            except:
+                v_num = i + 1
+            version = ((v_num - 1) // VIDEOS_PER_CAMPAIGN) + 1
+
+            if done_prompts:
+                meta = done_prompts[i % len(done_prompts)]
+                primary_text = meta.get("primary text", "")
+                headline = meta.get("headline meta", "")
+                prompt = meta.get("prompt", "")
+            else:
+                primary_text = ""
+                headline = ""
+                prompt = ""
+
+            for attempt in range(3):
+                try:
+                    master_ws.append_row(
+                        [ad_name, drive_link, direct_link,
+                         f"C{date}_{c}_{version:02d}",
+                         f"adset{version}_{c}_{date}",
+                         primary_text, headline, prompt],
+                        value_input_option="USER_ENTERED"
+                    )
+                    added += 1
+                    break
+                except Exception as se:
+                    print(f"  fix-sheet retry {attempt+1}: {se}")
+                    if attempt < 2:
+                        time.sleep(5)
+
+            time.sleep(1)
+
+        msg = f"[{c}] fix-sheet {date}: added {added}, skipped {skipped} (already in sheet)"
+        send_telegram(msg)
+        return {"status": "ok", "added": added, "skipped": skipped, "total_edited": len(edited_files)}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
 
 if __name__ == "__main__":
     import uvicorn

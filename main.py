@@ -69,6 +69,8 @@ FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
 is_generating = False
 is_reediting = False
+last_activity_time = time.time()
+WATCHDOG_TIMEOUT = 1800
 
 # ============================================================
 # GOOGLE AUTH
@@ -659,6 +661,8 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
             )
 
         print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
+        global last_activity_time
+        last_activity_time = time.time()
         with counters["lock"]:
             counters["success"] += 1
         task["status"] = "done"
@@ -819,6 +823,7 @@ def generate_and_process(country=None):
                         flag = data["data"].get("successFlag", 0)
 
                         if flag == 1:
+                            last_activity_time = time.time()
                             urls = data["data"].get("response", {}).get("resultUrls", [])
                             if not urls:
                                 task["status"] = "failed"
@@ -969,11 +974,21 @@ def has_unedited_originals():
 
 def cron_loop():
     """Background thread: auto-generate new videos AND auto-reedit failed ones."""
-    global is_generating, is_reediting
+    global is_generating, is_reediting, last_activity_time
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
         time.sleep(CRON_INTERVAL)
         try:
+            stale = time.time() - last_activity_time
+            if is_generating and stale > WATCHDOG_TIMEOUT:
+                print(f"WATCHDOG: is_generating stuck for {stale:.0f}s, forcing reset!")
+                send_telegram(f"WATCHDOG: pipeline stuck for {stale:.0f}s, forcing is_generating=False")
+                is_generating = False
+            if is_reediting and stale > WATCHDOG_TIMEOUT:
+                print(f"WATCHDOG: is_reediting stuck for {stale:.0f}s, forcing reset!")
+                send_telegram(f"WATCHDOG: reedit stuck for {stale:.0f}s, forcing is_reediting=False")
+                is_reediting = False
+
             if not is_reediting:
                 print("Cron: checking for unedited originals...")
                 result = has_unedited_originals()
@@ -1027,11 +1042,13 @@ def root():
 
 @app.get("/status")
 def status():
+    stale = round(time.time() - last_activity_time)
     return {
         "generating": is_generating,
         "reediting": is_reediting,
         "cron_enabled": cron_enabled,
         "countries": list(COUNTRY_CONFIG.keys()),
+        "last_activity_seconds_ago": stale,
     }
 
 @app.post("/generate")
@@ -1296,6 +1313,7 @@ def reedit_originals(country, date_str):
                                     send_telegram(f"[{country}] Sheet write FAILED for V{v_idx}: {str(se)[:100]}")
 
                         total_success += 1
+                        last_activity_time = time.time()
                         if total_success % 10 == 0:
                             send_telegram(f"[{country}] Reedit progress: {edit_count + i + 1}/{len(orig_files)} edited ({total_success} this run)")
 

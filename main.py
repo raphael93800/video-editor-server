@@ -1295,15 +1295,24 @@ def reedit_originals(country, date_str):
                 campaign_name = f"C{date_str}_{country}_{version:02d}"
                 adset_name = f"adset{version}_{country}_{date_str}"
                 drive_link, direct_link = make_drive_links(out_id)
-                with sheet_lock:
-                    _, gc_t = get_google_services()
-                    master_ws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
-                    master_ws.append_row(
-                        [nom_final.replace(".mp4", ""), drive_link, direct_link,
-                         campaign_name, adset_name,
-                         meta_src["primary_text"], meta_src["headline_meta"], meta_src["prompt"]],
-                        value_input_option="USER_ENTERED"
-                    )
+
+                # Rate-limited: retry sheet write up to 3 times
+                for attempt in range(3):
+                    try:
+                        with sheet_lock:
+                            _, gc_t = get_google_services()
+                            master_ws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
+                            master_ws.append_row(
+                                [nom_final.replace(".mp4", ""), drive_link, direct_link,
+                                 campaign_name, adset_name,
+                                 meta_src["primary_text"], meta_src["headline_meta"], meta_src["prompt"]],
+                                value_input_option="USER_ENTERED"
+                            )
+                        break
+                    except Exception as sheet_err:
+                        print(f"  [{country}] Sheet write attempt {attempt+1} failed: {sheet_err}")
+                        if attempt < 2:
+                            time.sleep(5)
 
                 success += 1
 
@@ -1312,8 +1321,6 @@ def reedit_originals(country, date_str):
                 print(f"  [{country}] Reedit V{v_idx} ERROR: {e}")
                 import traceback
                 traceback.print_exc()
-                # Keep going, don't stop the whole batch
-                continue
 
             finally:
                 for tmp in [local_raw]:
@@ -1328,6 +1335,8 @@ def reedit_originals(country, date_str):
                             os.remove(local_edited)
                     except:
                         pass
+                # Pause between videos to avoid Google API rate limits
+                time.sleep(2)
 
         for p in [local_part2, local_part2_clean]:
             try:

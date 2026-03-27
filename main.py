@@ -295,12 +295,10 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
 # ============================================================
 def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_index):
     """
-    Full FFmpeg editing pipeline on a local video file.
-    Returns path to the edited output file, or raises on error.
-    metadata: dict with keys title, headline, primary_text, prompt
+    Low-memory FFmpeg pipeline: only 1 full encode (the final render).
+    All intermediate steps use stream copy or audio-only extraction.
     """
     pfx = f"/tmp/edit_{country}_{vid_index}"
-    local_hook_clean = f"{pfx}_clean.mp4"
     local_hook_audio = f"{pfx}_audio.wav"
     local_hook_cut   = f"{pfx}_cut.mp4"
     local_concat     = f"{pfx}_concat.mp4"
@@ -309,68 +307,70 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
     local_out        = f"{pfx}_final.mp4"
     concat_list      = f"{pfx}_list.txt"
 
-    temps = [local_hook_clean, local_hook_audio, local_hook_cut,
+    temps = [local_hook_audio, local_hook_cut,
              local_concat, local_audio, local_srt, concat_list]
 
     try:
-        video_title   = metadata.get("title", "") or DEFAULT_TITLE
-        video_prompt  = metadata.get("prompt", "")
+        video_title = metadata.get("title", "") or DEFAULT_TITLE
 
-        # 1. Re-encode hook
-        reencode_video(local_hook_raw, local_hook_clean)
-        if not has_video_stream(local_hook_clean):
-            raise Exception("No video stream after re-encoding")
-        hook_duration = get_video_duration(local_hook_clean)
-        print(f"  [{country}] Hook re-encoded: {hook_duration:.2f}s")
+        # 1. Get duration + extract audio for speech detection (no video encode)
+        hook_duration = get_video_duration(local_hook_raw)
+        print(f"  [{country}] Hook duration: {hook_duration:.2f}s")
 
-        # 2. Speech detection
         subprocess.run([
-            "ffmpeg", "-y", "-i", local_hook_clean,
+            "ffmpeg", "-y", "-i", local_hook_raw,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             local_hook_audio
         ], check=True, capture_output=True)
         start_t, end_t = get_speech_bounds(local_hook_audio, hook_duration)
         print(f"  [{country}] Speech: {start_t:.2f}s -> {end_t:.2f}s")
 
-        # 3. Cut hook to speech bounds
+        # Clean up audio early to free memory
+        if os.path.exists(local_hook_audio):
+            os.remove(local_hook_audio)
+
+        # 2. Cut hook with re-encode (needed for clean concat with Part2)
         subprocess.run([
-            "ffmpeg", "-y", "-i", local_hook_clean,
+            "ffmpeg", "-y", "-i", local_hook_raw,
             "-ss", str(start_t), "-to", str(end_t),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-ar", "44100",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-r", "24", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
             local_hook_cut
         ], check=True, capture_output=True)
-        if not has_video_stream(local_hook_cut):
-            raise Exception("No video stream after cutting")
 
-        # 4. Concat hook + Part2
+        # 3. Concat cut + Part2 using stream copy (zero RAM for video)
         with open(concat_list, "w") as cl:
             cl.write(f"file '{local_hook_cut}'\n")
             cl.write(f"file '{local_part2_clean}'\n")
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c:v", "libx264", "-c:a", "aac",
-            "-preset", "fast", "-crf", "23",
+            "-i", concat_list, "-c", "copy",
             "-movflags", "+faststart",
             local_concat
         ], check=True, capture_output=True)
-        if not has_video_stream(local_concat):
-            raise Exception("No video stream after concat")
 
-        # 5. Extract full audio for subtitles
+        # Clean up cut to free disk
+        if os.path.exists(local_hook_cut):
+            os.remove(local_hook_cut)
+
+        # 4. Extract audio from concat for subtitles (no video processing)
         subprocess.run([
             "ffmpeg", "-y", "-i", local_concat,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             local_audio
         ], check=True, capture_output=True)
 
-        # 6. Generate SRT subtitles
+        # 5. Generate SRT subtitles
         srt_content = generate_srt(local_audio)
         with open(local_srt, "w", encoding="utf-8") as sf:
             sf.write(srt_content)
 
-        # 7. Build title filter
+        # Clean up full audio early
+        if os.path.exists(local_audio):
+            os.remove(local_audio)
+
+        # 6. Build title + subtitle filters
         title_clean = video_title.replace("\n", " ").strip()
         words_t = title_clean.split()
         line1, line2 = "", ""
@@ -410,27 +410,30 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
                 f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
             )
 
-        # 8. Burn title + subtitles
         sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
         all_filters = [title_filter] + sub_filters
         vf_filter = ",".join(all_filters)
 
+        # 7. Single final encode: burn title + subtitles (the only heavy encode)
         result = subprocess.run([
             "ffmpeg", "-y", "-i", local_concat,
             "-vf", vf_filter,
-            "-c:v", "libx264", "-c:a", "aac",
-            "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "aac",
             "-movflags", "+faststart",
             local_out
         ], capture_output=True, text=True)
 
-        if result.returncode != 0:
-            print(f"  [{country}] Overlay error, using concat as fallback: {result.stderr[-300:]}")
-            import shutil
-            shutil.copy(local_concat, local_out)
+        # Clean up concat before checking result to free disk/RAM
+        if os.path.exists(local_concat):
+            os.remove(local_concat)
 
-        if not has_video_stream(local_out):
-            raise Exception("No video stream in final output")
+        if result.returncode != 0:
+            print(f"  [{country}] Overlay stderr: {result.stderr[-500:]}")
+            raise Exception(f"Final encode failed (exit {result.returncode})")
+
+        if not os.path.exists(local_out) or os.path.getsize(local_out) < 10000:
+            raise Exception(f"Output file missing or too small")
 
         final_duration = get_video_duration(local_out)
         print(f"  [{country}] Edited video: {final_duration:.2f}s")

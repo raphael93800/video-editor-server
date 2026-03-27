@@ -894,27 +894,39 @@ def has_pending_prompts():
     """Quick check: are there any non-done prompts in any country tab?"""
     try:
         _, gc = get_google_services()
-        for c_cfg in COUNTRY_CONFIG.values():
+        for c_name, c_cfg in COUNTRY_CONFIG.items():
             prompts = get_prompts_for_country(gc, c_cfg, limit=1)
             if prompts:
+                print(f"  Cron: found pending prompts in {c_name}")
                 return True
     except Exception as e:
         print(f"  Cron check error: {e}")
+        import traceback
+        traceback.print_exc()
     return False
 
 def cron_loop():
     """Background thread that checks for new prompts and auto-launches."""
+    global is_generating
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
         time.sleep(CRON_INTERVAL)
         if is_generating:
+            print("Cron: skipping, pipeline already running")
             continue
         try:
+            print("Cron: checking for pending prompts...")
             if has_pending_prompts():
                 print("Cron: pending prompts found, launching pipeline...")
+                is_generating = True
                 generate_and_process()
+            else:
+                print("Cron: no pending prompts")
         except Exception as e:
             print(f"Cron error: {e}")
+            import traceback
+            traceback.print_exc()
+            is_generating = False
 
 @app.on_event("startup")
 def start_cron():

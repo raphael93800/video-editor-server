@@ -605,6 +605,12 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
         print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
+        # Mark done NOW so we never re-generate (and re-pay) this video
+        with sheet_lock:
+            _, gc_mark = get_google_services()
+            mark_prompt_done(gc_mark, c_cfg, row_index)
+        print(f"  [{c_name}] V{vid_index} marked done (row {row_index})")
+
         # Limit concurrent FFmpeg edits to avoid OOM on Render
         print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
         edit_semaphore.acquire()
@@ -644,7 +650,6 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
                 ],
                 value_input_option="USER_ENTERED"
             )
-            mark_prompt_done(gc_thread, c_cfg, row_index)
 
         print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
         with counters["lock"]:

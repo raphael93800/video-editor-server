@@ -578,6 +578,7 @@ def mark_prompt_done(gc, country_cfg, row_index):
 # threaded editing, auto-backfill from prompt queue
 # ============================================================
 sheet_lock = threading.Lock()
+edit_semaphore = threading.Semaphore(2)
 
 def process_ready_video_thread(task, drive_service, c_name, c_cfg,
                                local_part2_clean, edited_folder_id, original_folder_id,
@@ -604,15 +605,22 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
         print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
-        metadata = {
-            "title": p_data["title_of_video"] or DEFAULT_TITLE,
-            "headline": p_data["headline_meta"],
-            "primary_text": p_data["primary_text"],
-            "prompt": prompt_text,
-        }
-        local_edited = edit_single_video(
-            local_hook_raw, local_part2_clean, metadata, c_name, vid_index
-        )
+        # Limit concurrent FFmpeg edits to avoid OOM on Render
+        print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
+        edit_semaphore.acquire()
+        try:
+            print(f"  [{c_name}] V{vid_index} editing...")
+            metadata = {
+                "title": p_data["title_of_video"] or DEFAULT_TITLE,
+                "headline": p_data["headline_meta"],
+                "primary_text": p_data["primary_text"],
+                "prompt": prompt_text,
+            }
+            local_edited = edit_single_video(
+                local_hook_raw, local_part2_clean, metadata, c_name, vid_index
+            )
+        finally:
+            edit_semaphore.release()
 
         out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
         print(f"  [{c_name}] Edited uploaded: {nom_final}")

@@ -969,34 +969,32 @@ def has_unedited_originals():
 
 def cron_loop():
     """Background thread: auto-generate new videos AND auto-reedit failed ones."""
-    global is_generating
+    global is_generating, is_reediting
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
         time.sleep(CRON_INTERVAL)
         try:
-            # Priority 1: ALWAYS reedit failed originals first
             if not is_reediting:
                 print("Cron: checking for unedited originals...")
                 result = has_unedited_originals()
                 if result:
                     c_name, date_str = result
-                    print(f"Cron: found unedited originals for {c_name}/{date_str}, launching reedit...")
+                    print(f"Cron: found unedited for {c_name}/{date_str}, launching reedit in thread...")
                     is_reediting = True
-                    reedit_originals(c_name, date_str)
+                    threading.Thread(target=reedit_originals, args=(c_name, date_str), daemon=True).start()
                     continue
                 else:
                     print("Cron: no unedited originals")
             else:
-                print("Cron: reedit already running, skipping generation")
+                print("Cron: reedit in progress, skipping")
                 continue
 
-            # Priority 2: only generate new videos if nothing to reedit
             if not is_generating:
                 print("Cron: checking for pending prompts...")
                 if has_pending_prompts():
-                    print("Cron: pending prompts found, launching pipeline...")
+                    print("Cron: pending prompts found, launching pipeline in thread...")
                     is_generating = True
-                    generate_and_process()
+                    threading.Thread(target=generate_and_process, daemon=True).start()
             else:
                 print("Cron: generation already running")
 
@@ -1294,10 +1292,14 @@ def reedit_originals(country, date_str):
                                 time.sleep(5)
 
                         total_success += 1
+                        if total_success % 10 == 0:
+                            send_telegram(f"[{country}] Reedit progress: {edit_count + i + 1}/{len(orig_files)} edited ({total_success} this run)")
 
                     except Exception as e:
                         total_errors += 1
                         print(f"  [{country}] Reedit V{v_idx} ERROR: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                     finally:
                         for tmp in [local_raw]:

@@ -614,10 +614,13 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
         print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
-        with sheet_lock:
-            _, gc_orig = get_google_services()
-            mark_prompt_status(gc_orig, c_cfg, row_index, "done")
-        print(f"  [{c_name}] V{vid_index} marked done (original uploaded)")
+        try:
+            with sheet_lock:
+                _, gc_orig = get_google_services()
+                mark_prompt_status(gc_orig, c_cfg, row_index, "done")
+            print(f"  [{c_name}] V{vid_index} marked done (original uploaded)")
+        except Exception as sheet_e:
+            print(f"  [{c_name}] V{vid_index} sheet status update failed (non-fatal): {sheet_e}")
 
         print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
         edit_semaphore.acquire()
@@ -672,8 +675,10 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         task["status"] = "done"
 
     except Exception as e:
-        print(f"  [{c_name}] ERROR editing V{vid_index}: {e}")
-        send_telegram(f"[{c_name}] Error V{vid_index} (row {row_index}): {str(e)[:150]}")
+        import traceback
+        tb = traceback.format_exc()
+        print(f"  [{c_name}] ERROR editing V{vid_index}: {e}\n{tb}")
+        send_telegram(f"[{c_name}] Error V{vid_index} (row {row_index}): {str(e)[:150]}\n{tb[-300:]}")
         try:
             with sheet_lock:
                 _, gc_err = get_google_services()

@@ -4,7 +4,6 @@ import datetime
 import subprocess
 import time
 import threading
-from collections import deque
 import openai
 import gspread
 import requests as http_requests
@@ -31,32 +30,17 @@ TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
 GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
-# kie.ai (Veo 3.1) video generation
-KIE_API_KEY         = os.environ.get("KIE_API_KEY",         "2c6b074d932083a007b99a398bbe829c")
-KIE_API_BASE        = "https://api.kie.ai"
-KIE_MODEL           = os.environ.get("KIE_MODEL",           "veo3_fast")
-KIE_ASPECT_RATIO    = "9:16"
-
-# Prompt sheet
-PROMPTS_SHEET_ID    = os.environ.get("PROMPTS_SHEET_ID",    "13BxBpA1nZ8Vt-hlRDUqZcC6pTU0z-BMvwdtuZmnsy6g")
-MAX_VIDEOS_PER_RUN  = int(os.environ.get("MAX_VIDEOS_PER_RUN", "5"))
-MAX_CONCURRENT      = int(os.environ.get("MAX_CONCURRENT", "5"))
+HOOK_USA_FOLDER_ID  = os.environ.get("HOOK_USA_FOLDER_ID",  "1cXo5gwUkfraVUFY3PLsonja_Za_M7smk")
 
 # ============================================================
 # MULTI-COUNTRY CONFIG
 # ============================================================
 COUNTRY_CONFIG = {
     "USA": {
+        "hook_folder_id":    HOOK_USA_FOLDER_ID,
         "results_folder_id": os.environ.get("RESULTS_USA_FOLDER_ID", "1ZTciHcp8LtbLjsuwUbE0MEwuCNMJzbPQ"),
         "part2_file_id":     PART2_FILE_ID,
         "master_tab":        os.environ.get("MASTER_TAB_USA", "To launch (USA)"),
-        "prompt_tab":        os.environ.get("PROMPT_TAB_USA", "USA"),
-    },
-    "UK": {
-        "results_folder_id": os.environ.get("RESULTS_UK_FOLDER_ID", "1SeDVgbd1Fo3SyYdxRbmP4QeIpuqyAoni"),
-        "part2_file_id":     PART2_UK_FILE_ID,
-        "master_tab":        os.environ.get("MASTER_TAB_UK", "To launch (UK)"),
-        "prompt_tab":        os.environ.get("PROMPT_TAB_UK", "UK"),
     },
 }
 
@@ -67,8 +51,7 @@ MASTER_SHEET_HEADERS = [
 
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 
-is_generating = False
-is_reediting = False
+is_processing = False
 last_activity_time = time.time()
 WATCHDOG_TIMEOUT = 1800
 
@@ -146,6 +129,17 @@ def drive_upload_video(drive_service, local_path, parent_id, filename):
                 drive_service, _ = get_google_services()
             else:
                 raise
+
+def drive_move_file(drive_service, file_id, new_parent_id):
+    f = drive_service.files().get(fileId=file_id, fields="parents", supportsAllDrives=True).execute()
+    old_parents = ",".join(f.get("parents", []))
+    drive_service.files().update(
+        fileId=file_id,
+        addParents=new_parent_id,
+        removeParents=old_parents,
+        supportsAllDrives=True,
+        fields="id,parents"
+    ).execute()
 
 def make_drive_links(file_id):
     share_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
@@ -322,11 +316,9 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
 # ============================================================
 # EDIT A SINGLE VIDEO (local file + in-memory metadata)
 # ============================================================
+edit_semaphore = threading.Semaphore(1)
+
 def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_index):
-    """
-    Low-memory FFmpeg pipeline: only 1 full encode (the final render).
-    All intermediate steps use stream copy or audio-only extraction.
-    """
     pfx = f"/tmp/edit_{country}_{vid_index}"
     local_hook_audio = f"{pfx}_audio.wav"
     local_hook_cut   = f"{pfx}_cut.mp4"
@@ -342,7 +334,6 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
     try:
         video_title = metadata.get("title", "") or DEFAULT_TITLE
 
-        # 1. Get duration + extract audio for speech detection (no video encode)
         hook_duration = get_video_duration(local_hook_raw)
         print(f"  [{country}] Hook duration: {hook_duration:.2f}s")
 
@@ -354,11 +345,9 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
         start_t, end_t = get_speech_bounds(local_hook_audio, hook_duration)
         print(f"  [{country}] Speech: {start_t:.2f}s -> {end_t:.2f}s")
 
-        # Clean up audio early to free memory
         if os.path.exists(local_hook_audio):
             os.remove(local_hook_audio)
 
-        # 2. Cut hook with re-encode (needed for clean concat with Part2)
         subprocess.run([
             "ffmpeg", "-y", "-i", local_hook_raw,
             "-ss", str(start_t), "-to", str(end_t),
@@ -368,7 +357,6 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
             local_hook_cut
         ], check=True, capture_output=True)
 
-        # 3. Concat cut + Part2 using stream copy (zero RAM for video)
         with open(concat_list, "w") as cl:
             cl.write(f"file '{local_hook_cut}'\n")
             cl.write(f"file '{local_part2_clean}'\n")
@@ -379,27 +367,22 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
             local_concat
         ], check=True, capture_output=True)
 
-        # Clean up cut to free disk
         if os.path.exists(local_hook_cut):
             os.remove(local_hook_cut)
 
-        # 4. Extract audio from concat for subtitles (no video processing)
         subprocess.run([
             "ffmpeg", "-y", "-i", local_concat,
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             local_audio
         ], check=True, capture_output=True)
 
-        # 5. Generate SRT subtitles
         srt_content = generate_srt(local_audio)
         with open(local_srt, "w", encoding="utf-8") as sf:
             sf.write(srt_content)
 
-        # Clean up full audio early
         if os.path.exists(local_audio):
             os.remove(local_audio)
 
-        # 6. Build title + subtitle filters
         title_clean = video_title.replace("\n", " ").strip()
         words_t = title_clean.split()
         line1, line2 = "", ""
@@ -443,7 +426,6 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
         all_filters = [title_filter] + sub_filters
         vf_filter = ",".join(all_filters)
 
-        # 7. Single final encode: burn title + subtitles (the only heavy encode)
         result = subprocess.run([
             "ffmpeg", "-y", "-i", local_concat,
             "-vf", vf_filter,
@@ -453,7 +435,6 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
             local_out
         ], capture_output=True, text=True)
 
-        # Clean up concat before checking result to free disk/RAM
         if os.path.exists(local_concat):
             os.remove(local_concat)
 
@@ -477,640 +458,255 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
                 pass
 
 # ============================================================
-# KIE.AI (VEO 3.1) — VIDEO GENERATION API
+# HOOK SCANNER — process videos from HOOK folder
 # ============================================================
-KIE_HEADERS = {
-    "Authorization": f"Bearer {KIE_API_KEY}",
-    "Content-Type": "application/json",
-}
-
-def kie_generate_video(prompt: str) -> str:
-    resp = http_requests.post(
-        f"{KIE_API_BASE}/api/v1/veo/generate",
-        headers=KIE_HEADERS,
-        json={
-            "model": KIE_MODEL,
-            "prompt": prompt,
-            "aspect_ratio": KIE_ASPECT_RATIO,
-            "generationType": "TEXT_2_VIDEO",
-        },
-        timeout=30,
-    )
-    data = resp.json()
-    if data.get("code") != 200:
-        raise Exception(f"kie.ai generate error: {data.get('msg', resp.text[:200])}")
-    task_id = data["data"]["taskId"]
-    print(f"  kie.ai task created: {task_id}")
-    return task_id
-
-def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
-    elapsed = 0
-    while elapsed < max_wait:
-        time.sleep(interval)
-        elapsed += interval
-        resp = http_requests.get(
-            f"{KIE_API_BASE}/api/v1/veo/record-info",
-            headers=KIE_HEADERS,
-            params={"taskId": task_id},
-            timeout=30,
-        )
-        data = resp.json()
-        if data.get("code") != 200:
-            print(f"  kie.ai poll error: {data.get('msg', '')} — retrying...")
-            continue
-
-        flag = data["data"].get("successFlag", 0)
-        if flag == 1:
-            urls = data["data"].get("response", {}).get("resultUrls", [])
-            if urls:
-                print(f"  kie.ai video ready: {urls[0][:80]}...")
-                return urls[0]
-            raise Exception("kie.ai returned success but no resultUrls")
-        elif flag in (2, 3):
-            err = data["data"].get("errorMessage", "unknown error")
-            raise Exception(f"kie.ai generation failed (flag={flag}): {err}")
-
-        print(f"  kie.ai generating... ({elapsed}s / {max_wait}s)")
-
-    raise Exception(f"kie.ai timeout after {max_wait}s for task {task_id}")
-
-def kie_download_video(url: str, local_path: str):
-    for attempt in range(3):
-        try:
-            resp = http_requests.get(url, stream=True, timeout=120)
-            resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            if os.path.getsize(local_path) < 1000:
-                raise Exception(f"Downloaded file too small: {os.path.getsize(local_path)} bytes")
-            print(f"  kie.ai video downloaded: {local_path}")
-            return
-        except Exception as e:
-            print(f"  kie.ai download attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(5)
-            else:
-                raise
-
-# ============================================================
-# PROMPT SHEET — read prompts per country
-# ============================================================
-PROMPT_SHEET_HEADERS = [
-    "Date", "prompt", "headline meta", "primary text", "title of video", "STATUS"
-]
-
-def get_prompts_for_country(gc, country_cfg, limit=None):
-    if limit is None:
-        limit = MAX_VIDEOS_PER_RUN
-
-    prompt_tab = country_cfg["prompt_tab"]
-    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
-    try:
-        ws = spreadsheet.worksheet(prompt_tab)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=prompt_tab, rows=1000, cols=20)
-        ws.append_row(PROMPT_SHEET_HEADERS, value_input_option="USER_ENTERED")
-        print(f"  Created prompt tab '{prompt_tab}'")
-        return []
-
-    all_rows = ws.get_all_values()
-    if len(all_rows) <= 1:
-        return []
-
-    headers = [h.strip().lower() for h in all_rows[0]]
-    prompts = []
-
-    for idx, row in enumerate(all_rows[1:], start=2):
-        row_dict = {}
-        for h_idx, h in enumerate(headers):
-            row_dict[h] = row[h_idx].strip() if h_idx < len(row) else ""
-
-        status = row_dict.get("status", "").lower()
-        if status != "ready":
-            continue
-
-        prompt_text = row_dict.get("prompt", "")
-        if not prompt_text:
-            continue
-
-        prompts.append({
-            "row_index": idx,
-            "prompt": prompt_text,
-            "title_of_video": row_dict.get("title of video", ""),
-            "headline_meta": row_dict.get("headline meta", ""),
-            "primary_text": row_dict.get("primary text", ""),
-        })
-
-        if len(prompts) >= limit:
-            break
-
-    return prompts
-
-def mark_prompt_status(gc, country_cfg, row_index, status):
-    prompt_tab = country_cfg["prompt_tab"]
-    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
-    ws = spreadsheet.worksheet(prompt_tab)
-    headers = [h.strip().lower() for h in ws.row_values(1)]
-    if "status" in headers:
-        col = headers.index("status") + 1
-        ws.update_cell(row_index, col, status)
-
-def mark_prompt_done(gc, country_cfg, row_index):
-    mark_prompt_status(gc, country_cfg, row_index, "done")
-
-# ============================================================
-# CONTINUOUS PIPELINE — pool of N concurrent generations,
-# threaded editing, auto-backfill from prompt queue
-# ============================================================
-sheet_lock = threading.Lock()
-edit_semaphore = threading.Semaphore(1)
-
-def process_ready_video_thread(task, drive_service, c_name, c_cfg,
-                               local_part2_clean, edited_folder_id, original_folder_id,
-                               date_du_jour, counters):
+def process_hook_videos(country="USA"):
     """
-    Thread target: download, upload original, edit, upload edited, log, mark done.
-    Uses its own gspread client to avoid thread-safety issues.
-    `counters` is a dict with a lock for thread-safe success/error counting.
+    Scan HOOK folder for new .mp4 videos.
+    For each video:
+      1. Download it
+      2. Move original to RESULTS/<country>/<date>/original/
+      3. Edit it (FFmpeg + Part2 + subtitles)
+      4. Upload edited to RESULTS/<country>/<date>/edited/
+      5. Log to Master Sheet
+      6. Remove from HOOK folder (move to original/)
     """
-    p_data = task["prompt_data"]
-    vid_index = task["vid_index"]
-    video_url = task["video_url"]
-    row_index = p_data["row_index"]
-    prompt_text = p_data["prompt"]
-    nom_final = f"{date_du_jour}_V{vid_index}.mp4"
+    global is_processing, last_activity_time
+    c_cfg = COUNTRY_CONFIG[country]
+    hook_folder_id = c_cfg["hook_folder_id"]
+    results_folder_id = c_cfg["results_folder_id"]
+    date_str = datetime.datetime.now().strftime("%d.%m")
 
-    local_hook_raw = f"/tmp/hook_raw_{c_name}_{vid_index}.mp4"
-    local_edited = None
+    total_success = 0
+    total_errors = 0
+
+    local_part2 = f"/tmp/part2_hook_{country}.mp4"
+    local_part2_clean = f"/tmp/part2_hook_clean_{country}.mp4"
 
     try:
-        kie_download_video(video_url, local_hook_raw)
+        drive_svc, gc = get_google_services()
 
-        orig_filename = f"veo_{datetime.datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}.mp4"
-        drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
-        print(f"  [{c_name}] Original uploaded: {orig_filename}")
-
-        try:
-            with sheet_lock:
-                _, gc_orig = get_google_services()
-                mark_prompt_status(gc_orig, c_cfg, row_index, "done")
-            print(f"  [{c_name}] V{vid_index} marked done (original uploaded)")
-        except Exception as sheet_e:
-            print(f"  [{c_name}] V{vid_index} sheet status update failed (non-fatal): {sheet_e}")
-
-        print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
-        edit_semaphore.acquire()
-        try:
-            print(f"  [{c_name}] V{vid_index} editing...")
-            metadata = {
-                "title": p_data["title_of_video"] or DEFAULT_TITLE,
-                "headline": p_data["headline_meta"],
-                "primary_text": p_data["primary_text"],
-                "prompt": prompt_text,
-            }
-            local_edited = edit_single_video(
-                local_hook_raw, local_part2_clean, metadata, c_name, vid_index
-            )
-        finally:
-            edit_semaphore.release()
-
-        if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
-            raise Exception(f"Edited file missing or too small ({os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0} bytes)")
-
-        dup_check = drive_service.files().list(
-            q=f"'{edited_folder_id}' in parents and trashed=false and name='{nom_final}'",
-            fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True
+        # List videos in HOOK folder
+        hook_q = f"'{hook_folder_id}' in parents and trashed=false and mimeType='video/mp4'"
+        hook_files = drive_svc.files().list(
+            q=hook_q, fields="files(id,name)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
         ).execute().get("files", [])
-        if dup_check:
-            print(f"  [{c_name}] {nom_final} already exists in edited/, skipping upload")
-            out_id = dup_check[0]["id"]
-        else:
-            out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
-            print(f"  [{c_name}] Edited uploaded: {nom_final}")
 
-        version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
-        campaign_name = f"C{date_du_jour}_{c_name}_{version:02d}"
-        adset_name    = f"adset{version}_{c_name}_{date_du_jour}"
-        drive_link, direct_link = make_drive_links(out_id)
+        # Also list .txt metadata files in HOOK
+        txt_q = f"'{hook_folder_id}' in parents and trashed=false and name contains '.txt'"
+        txt_files_list = drive_svc.files().list(
+            q=txt_q, fields="files(id,name)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+        ).execute().get("files", [])
+        txt_files = {f["name"]: f for f in txt_files_list}
 
-        with sheet_lock:
-            _, gc_thread = get_google_services()
-            master_ws = get_or_create_master_tab(gc_thread, c_cfg["master_tab"])
-            master_ws.append_row(
-                [
-                    nom_final.replace(".mp4", ""),
-                    drive_link, direct_link,
-                    campaign_name, adset_name,
-                    p_data["primary_text"],
-                    p_data["headline_meta"],
-                    prompt_text,
-                ],
-                value_input_option="USER_ENTERED"
-            )
-
-        with sheet_lock:
-            _, gc_ed = get_google_services()
-            mark_prompt_status(gc_ed, c_cfg, row_index, "edited")
-        print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
-        global last_activity_time
-        last_activity_time = time.time()
-        with counters["lock"]:
-            counters["success"] += 1
-        task["status"] = "done"
-
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        print(f"  [{c_name}] ERROR editing V{vid_index}: {e}\n{tb}")
-        send_telegram(f"[{c_name}] Error V{vid_index} (row {row_index}): {str(e)[:150]}\n{tb[-300:]}")
-        try:
-            with sheet_lock:
-                _, gc_err = get_google_services()
-                mark_prompt_status(gc_err, c_cfg, row_index, "error")
-        except:
-            pass
-        with counters["lock"]:
-            counters["errors"] += 1
-        task["status"] = "failed"
-
-    finally:
-        for tmp in [local_hook_raw]:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except:
-                pass
-        if local_edited:
-            try:
-                if os.path.exists(local_edited):
-                    os.remove(local_edited)
-            except:
-                pass
-
-
-def generate_and_process(country=None):
-    """
-    Continuous pipeline per country:
-    - Load ALL pending prompts into a queue
-    - Maintain MAX_CONCURRENT kie.ai generations in flight at all times
-    - As soon as one finishes, edit it in a background thread and immediately
-      submit the next prompt from the queue
-    - No batch boundaries, no dead time
-    """
-    global is_generating
-    date_du_jour = datetime.datetime.now().strftime("%d.%m")
-
-    countries_to_process = {}
-    if country:
-        c = country.upper()
-        if c not in COUNTRY_CONFIG:
-            print(f"Unknown country: {c}. Available: {list(COUNTRY_CONFIG.keys())}")
-            is_generating = False
+        if not hook_files:
             return
-        countries_to_process = {c: COUNTRY_CONFIG[c]}
-    else:
-        countries_to_process = COUNTRY_CONFIG
 
-    try:
-        drive_service, gc = get_google_services()
-        counters = {"success": 0, "errors": 0, "lock": threading.Lock()}
+        print(f"[{country}] Found {len(hook_files)} video(s) in HOOK folder")
+        send_telegram(f"[{country}] Processing {len(hook_files)} video(s) from HOOK")
 
-        for c_name, c_cfg in countries_to_process.items():
-            print(f"\n{'='*50}")
-            print(f"CONTINUOUS PIPELINE: {c_name}")
-            print(f"{'='*50}")
+        # Create date folders in RESULTS
+        date_folder_id = drive_get_or_create_folder(drive_svc, results_folder_id, date_str)
+        original_folder_id = drive_get_or_create_folder(drive_svc, date_folder_id, "original")
+        edited_folder_id = drive_get_or_create_folder(drive_svc, date_folder_id, "edited")
 
-            results_folder_id = c_cfg["results_folder_id"]
-            part2_file_id = c_cfg["part2_file_id"]
+        # Determine next V number from existing edited files
+        existing_edited = drive_svc.files().list(
+            q=f"'{edited_folder_id}' in parents and trashed=false and mimeType='video/mp4'",
+            fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+        ).execute().get("files", [])
+        edited_names = {f["name"] for f in existing_edited}
 
-            today_folder_id    = drive_get_or_create_folder(drive_service, results_folder_id, date_du_jour)
-            edited_folder_id   = drive_get_or_create_folder(drive_service, today_folder_id, "edited")
-            original_folder_id = drive_get_or_create_folder(drive_service, today_folder_id, "original")
+        max_v = 0
+        for ef in existing_edited:
+            try:
+                v_num = int(ef["name"].split("_V")[-1].replace(".mp4", ""))
+                if v_num > max_v:
+                    max_v = v_num
+            except:
+                pass
 
-            local_part2       = f"/tmp/part2_{c_name}.mp4"
-            local_part2_clean = f"/tmp/part2_clean_{c_name}.mp4"
-            for p in [local_part2, local_part2_clean]:
-                if os.path.exists(p):
-                    os.remove(p)
-            drive_download_file(drive_service, part2_file_id, local_part2)
-            reencode_video(local_part2, local_part2_clean)
-            print(f"  [{c_name}] Part2 ready")
+        # Download Part2 once
+        for p in [local_part2, local_part2_clean]:
+            if os.path.exists(p):
+                os.remove(p)
+        drive_download_file(drive_svc, c_cfg["part2_file_id"], local_part2)
+        reencode_video(local_part2, local_part2_clean)
+        print(f"  [{country}] Part2 ready")
 
-            _, gc_fresh = get_google_services()
-            all_prompts = get_prompts_for_country(gc_fresh, c_cfg, limit=9999)
-            if not all_prompts:
-                print(f"  [{c_name}] No pending prompts")
+        vid_index = max_v + 1
+        for hook_file in sorted(hook_files, key=lambda x: x["name"]):
+            nom_final = f"{date_str}_V{vid_index}.mp4"
+
+            if nom_final in edited_names:
+                print(f"  [{country}] Skipping V{vid_index}: already exists in edited/")
+                vid_index += 1
                 continue
 
-            prompt_queue = deque(all_prompts)
-            total_prompts = len(prompt_queue)
-            send_telegram(f"[{c_name}] Starting continuous pipeline: {total_prompts} video(s), {MAX_CONCURRENT} concurrent")
+            local_raw = f"/tmp/hook_{country}_{vid_index}.mp4"
+            local_edited = None
 
-            existing_edited = drive_service.files().list(
-                q=f"'{edited_folder_id}' in parents and trashed=false",
-                fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
-            ).execute().get("files", [])
-            max_v = 0
-            for ef in existing_edited:
+            # Read metadata from .txt file if available
+            txt_name = hook_file["name"].replace(".mp4", ".txt")
+            meta = {"title": DEFAULT_TITLE, "headline": "", "primary_text": "", "prompt": ""}
+            if txt_name in txt_files:
                 try:
-                    v_num = int(ef["name"].split("_V")[-1].replace(".mp4", ""))
-                    if v_num > max_v:
-                        max_v = v_num
-                except:
-                    pass
-            next_vid_index = max_v + 1
-            print(f"  [{c_name}] {len(existing_edited)} edited, max V{max_v}, starting at V{next_vid_index}")
-            vid_index_lock = threading.Lock()
-
-            active_tasks = {}
-            edit_threads = []
-            max_wait = 900
-            interval = 15
-
-            def get_next_vid_index():
-                nonlocal next_vid_index
-                with vid_index_lock:
-                    idx = next_vid_index
-                    next_vid_index += 1
-                    return idx
-
-            def submit_next():
-                """Pop next prompt from queue and submit to kie.ai. Returns True if added to active_tasks."""
-                if not prompt_queue:
-                    return False
-                p_data = prompt_queue.popleft()
-                try:
-                    # Mark processing FIRST so cron never re-picks this prompt
-                    with sheet_lock:
-                        _, gc_proc = get_google_services()
-                        mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
-
-                    task_id = kie_generate_video(p_data["prompt"])
-                    vid_idx = get_next_vid_index()
-                    active_tasks[task_id] = {
-                        "task_id": task_id,
-                        "prompt_data": p_data,
-                        "vid_index": vid_idx,
-                        "status": "generating",
-                        "video_url": None,
-                        "elapsed": 0,
+                    d_svc_meta, _ = get_google_services()
+                    txt_content = d_svc_meta.files().get_media(
+                        fileId=txt_files[txt_name]["id"], supportsAllDrives=True
+                    ).execute().decode("utf-8")
+                    txt_json = json.loads(txt_content)
+                    meta = {
+                        "title": txt_json.get("video_title", DEFAULT_TITLE) or DEFAULT_TITLE,
+                        "headline": txt_json.get("headline", ""),
+                        "primary_text": txt_json.get("primary_text", ""),
+                        "prompt": txt_json.get("video_prompt", ""),
                     }
-                    print(f"  [{c_name}] Submitted V{vid_idx} (row {p_data['row_index']}), {len(active_tasks)} in flight, {len(prompt_queue)} queued")
-                    return True
-                except Exception as e:
-                    with counters["lock"]:
-                        counters["errors"] += 1
-                    print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
-                    send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
+                except Exception as meta_err:
+                    print(f"  [{country}] Could not read metadata {txt_name}: {meta_err}")
+
+            try:
+                d_svc, _ = get_google_services()
+
+                # Download video from HOOK
+                drive_download_file(d_svc, hook_file["id"], local_raw)
+
+                # Move original video from HOOK to RESULTS/<date>/original/
+                drive_move_file(d_svc, hook_file["id"], original_folder_id)
+                print(f"  [{country}] Moved {hook_file['name']} to original/")
+
+                # Move .txt metadata too if it exists
+                if txt_name in txt_files:
                     try:
-                        with sheet_lock:
-                            _, gc_err = get_google_services()
-                            mark_prompt_status(gc_err, c_cfg, p_data["row_index"], "error")
-                    except:
-                        pass
-                    return False
+                        drive_move_file(d_svc, txt_files[txt_name]["id"], original_folder_id)
+                    except Exception as txt_move_err:
+                        print(f"  [{country}] Could not move {txt_name}: {txt_move_err}")
 
-            # Seed the pool — stop on first failure to avoid marking everything processing
-            consecutive_fails = 0
-            while prompt_queue and len(active_tasks) < MAX_CONCURRENT and consecutive_fails < 3:
-                if submit_next():
-                    consecutive_fails = 0
-                else:
-                    consecutive_fails += 1
-                    time.sleep(5)
-
-            if not active_tasks:
-                print(f"  [{c_name}] All submissions failed")
-                continue
-
-            # Poll loop: runs until no active tasks
-            while active_tasks:
-                time.sleep(interval)
-
-                for task_id in list(active_tasks.keys()):
-                    task = active_tasks[task_id]
-                    if task["status"] != "generating":
-                        continue
-
-                    task["elapsed"] += interval
-
-                    try:
-                        resp = http_requests.get(
-                            f"{KIE_API_BASE}/api/v1/veo/record-info",
-                            headers=KIE_HEADERS,
-                            params={"taskId": task_id},
-                            timeout=30,
-                        )
-                        data = resp.json()
-                        if data.get("code") != 200:
-                            print(f"  kie.ai poll error for {task_id}: {data.get('msg', '')}")
-                            continue
-
-                        flag = data["data"].get("successFlag", 0)
-
-                        if flag == 1:
-                            last_activity_time = time.time()
-                            urls = data["data"].get("response", {}).get("resultUrls", [])
-                            if not urls:
-                                task["status"] = "failed"
-                                with counters["lock"]:
-                                    counters["errors"] += 1
-                                print(f"  [{c_name}] V{task['vid_index']}: success but no URL")
-                                del active_tasks[task_id]
-                                submit_next()
-                                continue
-
-                            task["video_url"] = urls[0]
-                            task["status"] = "editing"
-                            print(f"  [{c_name}] V{task['vid_index']} ready! Launching edit thread...")
-
-                            t = threading.Thread(
-                                target=process_ready_video_thread,
-                                args=(task, drive_service, c_name, c_cfg,
-                                      local_part2_clean, edited_folder_id, original_folder_id,
-                                      date_du_jour, counters),
-                                daemon=True,
-                            )
-                            t.start()
-                            edit_threads.append(t)
-
-                            del active_tasks[task_id]
-                            submit_next()
-
-                        elif flag in (2, 3):
-                            err = data["data"].get("errorMessage", "unknown")
-                            task["status"] = "failed"
-                            with counters["lock"]:
-                                counters["errors"] += 1
-                            print(f"  [{c_name}] V{task['vid_index']} generation failed: {err}")
-                            send_telegram(f"[{c_name}] V{task['vid_index']} failed: {err[:100]}")
-                            try:
-                                with sheet_lock:
-                                    _, gc_e = get_google_services()
-                                    mark_prompt_status(gc_e, c_cfg, task["prompt_data"]["row_index"], "error")
-                            except:
-                                pass
-                            del active_tasks[task_id]
-                            submit_next()
-
-                    except Exception as e:
-                        print(f"  [{c_name}] Poll error V{task['vid_index']}: {e}")
-
-                    if task_id in active_tasks and task["status"] == "generating" and task["elapsed"] >= max_wait:
-                        task["status"] = "failed"
-                        with counters["lock"]:
-                            counters["errors"] += 1
-                        print(f"  [{c_name}] V{task['vid_index']} timed out after {max_wait}s")
-                        send_telegram(f"[{c_name}] V{task['vid_index']} timed out")
-                        try:
-                            with sheet_lock:
-                                _, gc_to = get_google_services()
-                                mark_prompt_status(gc_to, c_cfg, task["prompt_data"]["row_index"], "error")
-                        except:
-                            pass
-                        del active_tasks[task_id]
-                        submit_next()
-
-                in_flight = len(active_tasks)
-                if in_flight > 0:
-                    print(f"  [{c_name}] {in_flight} generating, {len(prompt_queue)} queued, {len(edit_threads)} edit threads")
-
-            # Wait for all edit threads to finish
-            for t in edit_threads:
-                t.join(timeout=300)
-
-            done_count = counters["success"]
-            err_count = counters["errors"]
-            print(f"  [{c_name}] Country complete: {done_count} OK, {err_count} errors out of {total_prompts}")
-
-            for p in [local_part2, local_part2_clean]:
+                # Edit video
+                edit_semaphore.acquire()
                 try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except:
-                    pass
+                    local_edited = edit_single_video(local_raw, local_part2_clean, meta, country, vid_index)
+                finally:
+                    edit_semaphore.release()
 
-        msg = (
-            f"Pipeline complete!\n\n"
-            f"Countries: {', '.join(countries_to_process.keys())}\n"
-            f"{counters['success']} video(s) generated + edited\n"
-        )
-        if counters["errors"]:
-            msg += f"{counters['errors']} error(s)\n"
-        send_telegram(msg)
+                if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
+                    raise Exception("Edited file missing or too small")
+
+                # Upload edited video
+                out_id = drive_upload_video(d_svc, local_edited, edited_folder_id, nom_final)
+                print(f"  [{country}] Uploaded edited: {nom_final}")
+
+                # Log to Master Sheet
+                version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
+                drive_link, direct_link = make_drive_links(out_id)
+
+                for attempt in range(3):
+                    try:
+                        _, gc_t = get_google_services()
+                        mws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
+                        mws.append_row(
+                            [nom_final.replace(".mp4", ""), drive_link, direct_link,
+                             f"C{date_str}_{country}_{version:02d}",
+                             f"adset{version}_{country}_{date_str}",
+                             meta["primary_text"], meta["headline"], meta["prompt"]],
+                            value_input_option="USER_ENTERED"
+                        )
+                        break
+                    except Exception as se:
+                        print(f"  Sheet write retry {attempt+1}: {se}")
+                        if attempt < 2:
+                            time.sleep(5)
+                        else:
+                            print(f"  [{country}] SHEET WRITE FAILED for V{vid_index}")
+                            send_telegram(f"[{country}] Sheet write FAILED for V{vid_index}: {str(se)[:100]}")
+
+                total_success += 1
+                last_activity_time = time.time()
+                vid_index += 1
+
+                if total_success % 5 == 0:
+                    send_telegram(f"[{country}] Progress: {total_success} edited so far")
+
+            except Exception as e:
+                total_errors += 1
+                print(f"  [{country}] ERROR editing V{vid_index}: {e}")
+                import traceback
+                traceback.print_exc()
+                send_telegram(f"[{country}] Error V{vid_index}: {str(e)[:200]}")
+                vid_index += 1
+
+            finally:
+                for tmp in [local_raw]:
+                    try:
+                        if os.path.exists(tmp): os.remove(tmp)
+                    except: pass
+                if local_edited:
+                    try:
+                        if os.path.exists(local_edited): os.remove(local_edited)
+                    except: pass
+                time.sleep(2)
+
+        if total_success > 0 or total_errors > 0:
+            send_telegram(f"[{country}] HOOK batch done: {total_success} edited, {total_errors} errors")
 
     except Exception as e:
-        send_telegram(f"Critical error: {str(e)[:200]}")
-        print(f"Critical error: {e}")
+        print(f"[{country}] process_hook_videos critical error: {e}")
         import traceback
         traceback.print_exc()
+        send_telegram(f"[{country}] HOOK processing error: {str(e)[:200]}")
+
     finally:
-        is_generating = False
+        for p in [local_part2, local_part2_clean]:
+            try:
+                if os.path.exists(p): os.remove(p)
+            except: pass
+        is_processing = False
 
 # ============================================================
-# CRON — check sheet every 60s, auto-launch if prompts found
+# CRON — scan HOOK folder every 30s
 # ============================================================
 CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "30"))
 cron_enabled = os.environ.get("CRON_ENABLED", "true").lower() == "true"
 
-def has_pending_prompts():
-    """Quick check: are there any non-done prompts in any country tab?"""
-    try:
-        _, gc = get_google_services()
-        for c_name, c_cfg in COUNTRY_CONFIG.items():
-            prompts = get_prompts_for_country(gc, c_cfg, limit=1)
-            if prompts:
-                print(f"  Cron: found pending prompts in {c_name}")
-                return True
-    except Exception as e:
-        print(f"  Cron check error: {e}")
-        import traceback
-        traceback.print_exc()
-    return False
-
-def has_unedited_originals():
-    """Check if any country has originals in today's folder without matching edited files."""
+def has_hook_videos():
+    """Quick check: are there any .mp4 files in any HOOK folder?"""
     try:
         drive_service, _ = get_google_services()
-        date_str = datetime.datetime.now().strftime("%d.%m")
-
         for c_name, c_cfg in COUNTRY_CONFIG.items():
-            results_id = c_cfg["results_folder_id"]
-            q = f"'{results_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date_str}'"
-            resp = drive_service.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-            date_folders = resp.get("files", [])
-            if not date_folders:
-                continue
-
-            date_folder_id = date_folders[0]["id"]
-            sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
-            sub_resp = drive_service.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-            orig_id = None
-            edit_id = None
-            for f in sub_resp.get("files", []):
-                if f["name"] == "original":
-                    orig_id = f["id"]
-                elif f["name"] == "edited":
-                    edit_id = f["id"]
-
-            if not orig_id or not edit_id:
-                continue
-
-            orig_q = f"'{orig_id}' in parents and trashed=false"
-            orig_count = len(drive_service.files().list(q=orig_q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", []))
-            edit_q = f"'{edit_id}' in parents and trashed=false"
-            edit_count = len(drive_service.files().list(q=edit_q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", []))
-
-            if orig_count > edit_count:
-                print(f"  Cron: {c_name} {date_str} has {orig_count} originals but only {edit_count} edited")
-                return c_name, date_str
-
+            hook_id = c_cfg["hook_folder_id"]
+            q = f"'{hook_id}' in parents and trashed=false and mimeType='video/mp4'"
+            resp = drive_service.files().list(
+                q=q, fields="files(id)", supportsAllDrives=True,
+                includeItemsFromAllDrives=True, pageSize=1
+            ).execute()
+            if resp.get("files"):
+                return c_name
     except Exception as e:
-        print(f"  Cron unedited check error: {e}")
+        print(f"  Cron hook check error: {e}")
     return None
 
-
 def cron_loop():
-    """Background thread: auto-generate new videos AND auto-reedit failed ones."""
-    global is_generating, is_reediting, last_activity_time
+    """Background thread: scan HOOK folders for new videos and process them."""
+    global is_processing, last_activity_time
     print(f"Cron started (interval={CRON_INTERVAL}s)")
     while True:
         time.sleep(CRON_INTERVAL)
         try:
             stale = time.time() - last_activity_time
-            if is_generating and stale > WATCHDOG_TIMEOUT:
-                print(f"WATCHDOG: is_generating stuck for {stale:.0f}s, forcing reset!")
-                send_telegram(f"WATCHDOG: pipeline stuck for {stale:.0f}s, forcing is_generating=False")
-                is_generating = False
-            if is_reediting and stale > WATCHDOG_TIMEOUT:
-                print(f"WATCHDOG: is_reediting stuck for {stale:.0f}s, forcing reset!")
-                send_telegram(f"WATCHDOG: reedit stuck for {stale:.0f}s, forcing is_reediting=False")
-                is_reediting = False
+            if is_processing and stale > WATCHDOG_TIMEOUT:
+                print(f"WATCHDOG: is_processing stuck for {stale:.0f}s, forcing reset!")
+                send_telegram(f"WATCHDOG: processing stuck for {stale:.0f}s, forcing is_processing=False")
+                is_processing = False
 
-            if not is_reediting:
-                print("Cron: checking for unedited originals...")
-                result = has_unedited_originals()
-                if result:
-                    c_name, date_str = result
-                    print(f"Cron: found unedited for {c_name}/{date_str}, launching reedit in thread...")
-                    is_reediting = True
-                    threading.Thread(target=reedit_originals, args=(c_name, date_str), daemon=True).start()
-                    continue
-                else:
-                    print("Cron: no unedited originals")
-            else:
-                print("Cron: reedit in progress, skipping")
-                continue
-
-            if not is_generating:
-                print("Cron: checking for pending prompts...")
-                if has_pending_prompts():
-                    print("Cron: pending prompts found, launching pipeline in thread...")
-                    is_generating = True
-                    threading.Thread(target=generate_and_process, daemon=True).start()
-            else:
-                print("Cron: generation already running")
+            if not is_processing:
+                country = has_hook_videos()
+                if country:
+                    print(f"Cron: found videos in HOOK/{country}, processing...")
+                    is_processing = True
+                    last_activity_time = time.time()
+                    threading.Thread(target=process_hook_videos, args=(country,), daemon=True).start()
 
         except Exception as e:
             print(f"Cron error: {e}")
@@ -1132,8 +728,8 @@ def start_cron():
 @app.get("/")
 def root():
     return {
-        "status": "Video Editor Server running",
-        "generating": is_generating,
+        "status": "Video Editor Server (HOOK scanner mode)",
+        "processing": is_processing,
         "cron_enabled": cron_enabled,
         "cron_interval_s": CRON_INTERVAL,
         "countries": list(COUNTRY_CONFIG.keys()),
@@ -1143,8 +739,7 @@ def root():
 def status():
     stale = round(time.time() - last_activity_time)
     return {
-        "generating": is_generating,
-        "reediting": is_reediting,
+        "processing": is_processing,
         "cron_enabled": cron_enabled,
         "countries": list(COUNTRY_CONFIG.keys()),
         "last_activity_seconds_ago": stale,
@@ -1152,104 +747,49 @@ def status():
 
 @app.post("/reset")
 def reset_flags():
-    """Force reset generating/reediting flags + revert stuck 'processing' prompts back to 'READY'."""
-    global is_generating, is_reediting, last_activity_time
-    was_gen = is_generating
-    was_reedit = is_reediting
-    is_generating = False
-    is_reediting = False
+    global is_processing, last_activity_time
+    was = is_processing
+    is_processing = False
     last_activity_time = time.time()
+    send_telegram(f"Manual reset: processing {was}->False")
+    return {"status": "ok", "was_processing": was}
 
-    reverted = 0
-    try:
-        _, gc = get_google_services()
-        for c_name, c_cfg in COUNTRY_CONFIG.items():
-            ss = gc.open_by_key(PROMPTS_SHEET_ID)
-            ws = ss.worksheet(c_cfg["prompt_tab"])
-            all_rows = ws.get_all_values()
-            if not all_rows:
-                continue
-            headers = [h.strip().lower() for h in all_rows[0]]
-            if "status" not in headers:
-                continue
-            status_col = headers.index("status") + 1
-            for idx, row in enumerate(all_rows[1:], start=2):
-                st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
-                if st == "processing":
-                    ws.update_cell(idx, status_col, "READY")
-                    reverted += 1
-    except Exception as e:
-        print(f"Reset revert error: {e}")
-
-    send_telegram(f"Manual reset: generating {was_gen}->False, reediting {was_reedit}->False, reverted {reverted} processing->READY")
-    return {"status": "ok", "was_generating": was_gen, "was_reediting": was_reedit, "reverted_to_ready": reverted}
-
-@app.post("/generate")
-def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
-    """
-    Full pipeline: read prompts -> generate via kie.ai -> edit -> upload to RESULTS.
-    - No param: all countries.
-    - country=UK: UK only.
-    Also triggered automatically by cron every 60s.
-    """
-    global is_generating
-    if is_generating:
-        return JSONResponse({
-            "status": "already_running",
-            "message": "A generation is already in progress",
-        })
-    if country and country.upper() not in COUNTRY_CONFIG:
-        return JSONResponse(
-            {"status": "error", "message": f"Unknown country: {country}. Available: {list(COUNTRY_CONFIG.keys())}"},
-            status_code=400,
-        )
-    is_generating = True
-    background_tasks.add_task(generate_and_process, country)
-    target = country.upper() if country else "ALL"
-    return JSONResponse({
-        "status": "started",
-        "country": target,
-        "max_concurrent": MAX_CONCURRENT,
-        "message": f"Continuous pipeline started ({target})",
-    })
+@app.post("/process")
+def trigger_process(background_tasks: BackgroundTasks, country: str = "USA"):
+    """Manually trigger HOOK processing for a country."""
+    global is_processing
+    if is_processing:
+        return JSONResponse({"status": "already_running", "message": "Processing already in progress"})
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    is_processing = True
+    last_activity_time = time.time()
+    background_tasks.add_task(process_hook_videos, c)
+    return {"status": "started", "country": c}
 
 @app.post("/test-edit")
-def test_edit_one(country: str = "USA", date: str = None):
-    """Synchronously try to edit ONE original and return the exact error or success."""
+def test_edit_one(country: str = "USA"):
+    """Synchronously edit ONE video from HOOK and return success/error."""
     c = country.upper()
     if c not in COUNTRY_CONFIG:
         return {"error": f"Unknown country: {c}"}
     c_cfg = COUNTRY_CONFIG[c]
-    if not date:
-        date = datetime.datetime.now().strftime("%d.%m")
 
     try:
         drive_service, gc = get_google_services()
-        results_id = c_cfg["results_folder_id"]
+        hook_id = c_cfg["hook_folder_id"]
 
-        q = f"'{results_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date}'"
-        resp = drive_service.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        date_folders = resp.get("files", [])
-        if not date_folders:
-            return {"error": f"No folder {date}"}
+        q = f"'{hook_id}' in parents and trashed=false and mimeType='video/mp4'"
+        hook_files = drive_service.files().list(
+            q=q, fields="files(id,name)", supportsAllDrives=True,
+            includeItemsFromAllDrives=True, pageSize=1
+        ).execute().get("files", [])
 
-        date_folder_id = date_folders[0]["id"]
-        sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
-        sub_resp = drive_service.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-        orig_id = None
-        for f in sub_resp.get("files", []):
-            if f["name"] == "original":
-                orig_id = f["id"]
+        if not hook_files:
+            return {"error": "No videos in HOOK folder"}
 
-        if not orig_id:
-            return {"error": "No original/ folder"}
-
-        orig_q = f"'{orig_id}' in parents and trashed=false"
-        originals = drive_service.files().list(q=orig_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1).execute().get("files", [])
-        if not originals:
-            return {"error": "No originals found"}
-
-        test_file = originals[0]
+        test_file = hook_files[0]
         local_raw = f"/tmp/test_edit_raw.mp4"
         local_part2 = f"/tmp/test_part2.mp4"
         local_part2_clean = f"/tmp/test_part2_clean.mp4"
@@ -1257,7 +797,6 @@ def test_edit_one(country: str = "USA", date: str = None):
         drive_download_file(drive_service, test_file["id"], local_raw)
         raw_size = os.path.getsize(local_raw)
         raw_duration = get_video_duration(local_raw)
-        has_video = has_video_stream(local_raw)
 
         drive_download_file(drive_service, c_cfg["part2_file_id"], local_part2)
         reencode_video(local_part2, local_part2_clean)
@@ -1268,20 +807,16 @@ def test_edit_one(country: str = "USA", date: str = None):
         edited_size = os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0
         edited_duration = get_video_duration(local_edited) if edited_size > 0 else 0
 
-        # Cleanup
         for p in [local_raw, local_part2, local_part2_clean, local_edited]:
             try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except:
-                pass
+                if p and os.path.exists(p): os.remove(p)
+            except: pass
 
         return {
             "status": "success",
             "original": test_file["name"],
             "raw_size_mb": round(raw_size / 1024 / 1024, 2),
             "raw_duration": round(raw_duration, 2),
-            "has_video": has_video,
             "edited_size_mb": round(edited_size / 1024 / 1024, 2),
             "edited_duration": round(edited_duration, 2),
         }
@@ -1290,202 +825,9 @@ def test_edit_one(country: str = "USA", date: str = None):
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
 
-
-@app.post("/reedit")
-def trigger_reedit(background_tasks: BackgroundTasks, country: str = "USA", date: str = None):
-    """
-    Re-edit originals that are in Drive but not yet edited.
-    No kie.ai calls, no cost — just FFmpeg editing of existing files.
-    Runs independently of generate pipeline.
-    """
-    global is_reediting
-    if is_reediting:
-        return JSONResponse({"status": "already_running", "message": "A reedit is already in progress"})
-    c = country.upper()
-    if c not in COUNTRY_CONFIG:
-        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
-    if not date:
-        date = datetime.datetime.now().strftime("%d.%m")
-    is_reediting = True
-    background_tasks.add_task(reedit_originals, c, date)
-    return JSONResponse({"status": "started", "message": f"Re-editing unedited originals for {c} / {date}"})
-
-
-def reedit_originals(country, date_str):
-    """
-    Resilient reedit: loops until ALL originals are edited.
-    On any error, waits 10s and retries from where it left off.
-    Never gives up until original_count == edited_count.
-    """
-    global is_reediting
-    c_cfg = COUNTRY_CONFIG[country]
-    total_success = 0
-    total_errors = 0
-
-    # Download Part2 once
-    local_part2 = f"/tmp/part2_reedit_{country}.mp4"
-    local_part2_clean = f"/tmp/part2_reedit_clean_{country}.mp4"
-    try:
-        drive_svc, _ = get_google_services()
-        for p in [local_part2, local_part2_clean]:
-            if os.path.exists(p):
-                os.remove(p)
-        drive_download_file(drive_svc, c_cfg["part2_file_id"], local_part2)
-        reencode_video(local_part2, local_part2_clean)
-        print(f"  [{country}] Part2 ready for reedit")
-    except Exception as e:
-        send_telegram(f"[{country}] Reedit: can't prepare Part2: {str(e)[:150]}")
-        is_reediting = False
-        return
-
-    try:
-        while True:
-            try:
-                drive_svc, gc = get_google_services()
-                results_folder_id = c_cfg["results_folder_id"]
-
-                q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date_str}'"
-                date_folders = drive_svc.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
-                if not date_folders:
-                    print(f"[reedit] No folder {date_str}")
-                    break
-                date_folder_id = date_folders[0]["id"]
-
-                sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
-                subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
-                orig_folder_id = next((f["id"] for f in subs if f["name"] == "original"), None)
-                edit_folder_id = next((f["id"] for f in subs if f["name"] == "edited"), None)
-                if not orig_folder_id or not edit_folder_id:
-                    print(f"[reedit] Missing subfolders")
-                    break
-
-                orig_files = drive_svc.files().list(q=f"'{orig_folder_id}' in parents and trashed=false", fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", [])
-                edit_count = len(drive_svc.files().list(q=f"'{edit_folder_id}' in parents and trashed=false", fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500).execute().get("files", []))
-
-                originals_sorted = sorted(orig_files, key=lambda x: x["name"])
-                remaining = originals_sorted[edit_count:]
-
-                if not remaining:
-                    print(f"  [{country}] Reedit done: {edit_count}/{len(orig_files)}")
-                    send_telegram(f"[{country}] Reedit finished! {edit_count}/{len(orig_files)} edited ({total_success} this run, {total_errors} errors)")
-                    break
-
-                print(f"  [{country}] Reedit: {len(remaining)} left ({edit_count}/{len(orig_files)} done)")
-
-                # Get metadata
-                _, gc2 = get_google_services()
-                try:
-                    ss = gc2.open_by_key(PROMPTS_SHEET_ID)
-                    ws = ss.worksheet(c_cfg["prompt_tab"])
-                    all_rows = ws.get_all_values()
-                    headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
-                    done_prompts = []
-                    for row in all_rows[1:]:
-                        rd = {h: (row[hi].strip() if hi < len(row) else "") for hi, h in enumerate(headers)}
-                        if rd.get("status", "").lower() == "done" and rd.get("prompt", ""):
-                            done_prompts.append(rd)
-                except:
-                    done_prompts = []
-
-                vid_index = edit_count + 1
-                for i, orig in enumerate(remaining):
-                    v_idx = vid_index + i
-                    nom_final = f"{date_str}_V{v_idx}.mp4"
-                    local_raw = f"/tmp/reedit_{country}_{v_idx}.mp4"
-                    local_edited = None
-
-                    if done_prompts:
-                        meta = done_prompts[i % len(done_prompts)]
-                        meta_src = {"title_of_video": meta.get("title of video", ""), "headline_meta": meta.get("headline meta", ""), "primary_text": meta.get("primary text", ""), "prompt": meta.get("prompt", "")}
-                    else:
-                        meta_src = {"title_of_video": DEFAULT_TITLE, "headline_meta": "", "primary_text": "", "prompt": ""}
-
-                    try:
-                        d_svc, _ = get_google_services()
-                        drive_download_file(d_svc, orig["id"], local_raw)
-
-                        edit_semaphore.acquire()
-                        try:
-                            metadata = {
-                                "title": meta_src["title_of_video"] or DEFAULT_TITLE,
-                                "headline": meta_src["headline_meta"],
-                                "primary_text": meta_src["primary_text"],
-                                "prompt": meta_src["prompt"],
-                            }
-                            local_edited = edit_single_video(local_raw, local_part2_clean, metadata, country, v_idx)
-                        finally:
-                            edit_semaphore.release()
-
-                        if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
-                            raise Exception("Edited file missing or too small")
-
-                        out_id = drive_upload_video(d_svc, local_edited, edit_folder_id, nom_final)
-                        print(f"  [{country}] Reedit V{v_idx} done ({edit_count + i + 1}/{len(orig_files)})")
-
-                        version = ((v_idx - 1) // VIDEOS_PER_CAMPAIGN) + 1
-                        drive_link, direct_link = make_drive_links(out_id)
-
-                        for attempt in range(3):
-                            try:
-                                _, gc_t = get_google_services()
-                                mws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
-                                mws.append_row(
-                                    [nom_final.replace(".mp4", ""), drive_link, direct_link,
-                                     f"C{date_str}_{country}_{version:02d}",
-                                     f"adset{version}_{country}_{date_str}",
-                                     meta_src["primary_text"], meta_src["headline_meta"], meta_src["prompt"]],
-                                    value_input_option="USER_ENTERED"
-                                )
-                                break
-                            except Exception as se:
-                                print(f"  Sheet write retry {attempt+1}: {se}")
-                                if attempt < 2:
-                                    time.sleep(5)
-                                else:
-                                    print(f"  [{country}] SHEET WRITE FAILED for V{v_idx} after 3 attempts")
-                                    send_telegram(f"[{country}] Sheet write FAILED for V{v_idx}: {str(se)[:100]}")
-
-                        total_success += 1
-                        last_activity_time = time.time()
-                        if total_success % 10 == 0:
-                            send_telegram(f"[{country}] Reedit progress: {edit_count + i + 1}/{len(orig_files)} edited ({total_success} this run)")
-
-                    except Exception as e:
-                        total_errors += 1
-                        print(f"  [{country}] Reedit V{v_idx} ERROR: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                    finally:
-                        for tmp in [local_raw]:
-                            try:
-                                if os.path.exists(tmp): os.remove(tmp)
-                            except: pass
-                        if local_edited:
-                            try:
-                                if os.path.exists(local_edited): os.remove(local_edited)
-                            except: pass
-                        time.sleep(3)
-
-                # After processing this batch, loop back to re-check how many are left
-
-            except Exception as loop_err:
-                print(f"  [{country}] Reedit loop error: {loop_err}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(10)
-
-    finally:
-        for p in [local_part2, local_part2_clean]:
-            try:
-                if os.path.exists(p): os.remove(p)
-            except: pass
-        is_reediting = False
-
-
 @app.get("/debug")
 def debug_state():
-    """Diagnostic: list what's in RESULTS folders and prompt sheet status."""
+    """Show HOOK folder contents + RESULTS folder contents + Master Sheet row counts."""
     try:
         drive_service, gc = get_google_services()
         result = {}
@@ -1493,73 +835,45 @@ def debug_state():
         for c_name, c_cfg in COUNTRY_CONFIG.items():
             country_info = {}
 
-            # List RESULTS/<country> subfolders and files
-            results_id = c_cfg["results_folder_id"]
-            q = f"'{results_id}' in parents and trashed = false"
-            resp = drive_service.files().list(
-                q=q, fields="files(id, name, mimeType)",
-                supportsAllDrives=True, includeItemsFromAllDrives=True
-            ).execute()
-            date_folders = resp.get("files", [])
-            folders_info = {}
-            for df in date_folders:
-                if df["mimeType"] == "application/vnd.google-apps.folder":
-                    sub_q = f"'{df['id']}' in parents and trashed = false"
-                    sub_resp = drive_service.files().list(
-                        q=sub_q, fields="files(id, name, mimeType)",
-                        supportsAllDrives=True, includeItemsFromAllDrives=True
-                    ).execute()
-                    sub_files = sub_resp.get("files", [])
-                    sub_info = {}
-                    for sf in sub_files:
-                        if sf["mimeType"] == "application/vnd.google-apps.folder":
-                            inner_q = f"'{sf['id']}' in parents and trashed = false"
-                            inner_resp = drive_service.files().list(
-                                q=inner_q, fields="files(id, name)",
-                                supportsAllDrives=True, includeItemsFromAllDrives=True
-                            ).execute()
-                            inner_files = inner_resp.get("files", [])
-                            sub_info[sf["name"]] = {
-                                "count": len(inner_files),
-                                "files": [f["name"] for f in sorted(inner_files, key=lambda x: x["name"])]
-                            }
-                    folders_info[df["name"]] = sub_info
-            country_info["results_folders"] = folders_info
+            # HOOK folder contents
+            hook_id = c_cfg["hook_folder_id"]
+            hook_q = f"'{hook_id}' in parents and trashed=false"
+            hook_resp = drive_service.files().list(
+                q=hook_q, fields="files(id,name,mimeType)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+            ).execute().get("files", [])
+            hook_videos = [f["name"] for f in hook_resp if f.get("mimeType") == "video/mp4"]
+            hook_txts = [f["name"] for f in hook_resp if f["name"].endswith(".txt")]
+            country_info["hook"] = {
+                "videos": len(hook_videos),
+                "txt_files": len(hook_txts),
+                "video_names": sorted(hook_videos)[:20],
+            }
 
-            # Prompt sheet status
-            try:
-                ss = gc.open_by_key(PROMPTS_SHEET_ID)
-                ws = ss.worksheet(c_cfg["prompt_tab"])
-                all_rows = ws.get_all_values()
-                headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
-                status_idx = headers.index("status") if "status" in headers else -1
-                prompt_idx = headers.index("prompt") if "prompt" in headers else -1
-                done = 0
-                edited_p = 0
-                ready = 0
-                processing = 0
-                error = 0
-                other = 0
-                for r in all_rows[1:]:
-                    has_prompt = prompt_idx >= 0 and prompt_idx < len(r) and r[prompt_idx].strip()
-                    if not has_prompt:
-                        continue
-                    st = r[status_idx].strip().lower() if status_idx >= 0 and status_idx < len(r) else ""
-                    if st == "done":
-                        done += 1
-                    elif st == "edited":
-                        edited_p += 1
-                    elif st == "ready":
-                        ready += 1
-                    elif st == "processing":
-                        processing += 1
-                    elif st == "error":
-                        error += 1
-                    else:
-                        other += 1
-                country_info["prompts"] = {"total": done + edited_p + ready + processing + error + other, "ready": ready, "processing": processing, "done": done, "edited": edited_p, "error": error, "other": other}
-            except Exception as e:
-                country_info["prompts"] = {"error": str(e)}
+            # RESULTS folder contents
+            results_id = c_cfg["results_folder_id"]
+            q = f"'{results_id}' in parents and trashed = false and mimeType='application/vnd.google-apps.folder'"
+            date_folders = drive_service.files().list(
+                q=q, fields="files(id,name)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True
+            ).execute().get("files", [])
+            folders_info = {}
+            for df in sorted(date_folders, key=lambda x: x["name"]):
+                sub_q = f"'{df['id']}' in parents and trashed = false and mimeType='application/vnd.google-apps.folder'"
+                sub_resp = drive_service.files().list(
+                    q=sub_q, fields="files(id,name)",
+                    supportsAllDrives=True, includeItemsFromAllDrives=True
+                ).execute().get("files", [])
+                sub_info = {}
+                for sf in sub_resp:
+                    inner_q = f"'{sf['id']}' in parents and trashed = false and mimeType='video/mp4'"
+                    inner_count = len(drive_service.files().list(
+                        q=inner_q, fields="files(id)",
+                        supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+                    ).execute().get("files", []))
+                    sub_info[sf["name"]] = inner_count
+                folders_info[df["name"]] = sub_info
+            country_info["results"] = folders_info
 
             # Master sheet row count
             try:
@@ -1577,10 +891,7 @@ def debug_state():
 
 @app.post("/fix-sheet")
 def fix_sheet(country: str = "USA", date: str = None):
-    """
-    Sync Master Sheet with Drive: add rows for edited videos that are missing from the sheet.
-    Compares edited/ folder contents with Ad_Name column in Master Sheet.
-    """
+    """Sync Master Sheet with edited/ folder — add missing rows."""
     c = country.upper()
     if c not in COUNTRY_CONFIG:
         return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
@@ -1601,13 +912,24 @@ def fix_sheet(country: str = "USA", date: str = None):
         sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
         subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
         edit_folder_id = next((f["id"] for f in subs if f["name"] == "edited"), None)
+        orig_folder_id = next((f["id"] for f in subs if f["name"] == "original"), None)
         if not edit_folder_id:
             return {"status": "error", "message": "No edited/ folder found"}
 
         edited_files = drive_svc.files().list(
-            q=f"'{edit_folder_id}' in parents and trashed=false",
+            q=f"'{edit_folder_id}' in parents and trashed=false and mimeType='video/mp4'",
             fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
         ).execute().get("files", [])
+
+        # Load .txt metadata from original/ folder
+        orig_txts = {}
+        if orig_folder_id:
+            txt_q = f"'{orig_folder_id}' in parents and trashed=false and name contains '.txt'"
+            orig_txt_files = drive_svc.files().list(
+                q=txt_q, fields="files(id,name)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+            ).execute().get("files", [])
+            orig_txts = {f["name"]: f for f in orig_txt_files}
 
         master_ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
         existing_rows = master_ws.get_all_values()
@@ -1617,25 +939,10 @@ def fix_sheet(country: str = "USA", date: str = None):
                 if row:
                     existing_names.add(row[0].strip())
 
-        # Get metadata from prompts sheet
-        try:
-            ss = gc.open_by_key(PROMPTS_SHEET_ID)
-            ws = ss.worksheet(c_cfg["prompt_tab"])
-            all_rows = ws.get_all_values()
-            headers = [h.strip().lower() for h in all_rows[0]] if all_rows else []
-            done_prompts = []
-            for row in all_rows[1:]:
-                rd = {h: (row[hi].strip() if hi < len(row) else "") for hi, h in enumerate(headers)}
-                if rd.get("status", "").lower() == "done" and rd.get("prompt", ""):
-                    done_prompts.append(rd)
-        except:
-            done_prompts = []
-
         added = 0
         skipped = 0
-        edited_sorted = sorted(edited_files, key=lambda x: x["name"])
 
-        for i, ef in enumerate(edited_sorted):
+        for ef in sorted(edited_files, key=lambda x: x["name"]):
             ad_name = ef["name"].replace(".mp4", "")
             if ad_name in existing_names:
                 skipped += 1
@@ -1644,22 +951,15 @@ def fix_sheet(country: str = "USA", date: str = None):
             file_id = ef["id"]
             drive_link, direct_link = make_drive_links(file_id)
 
-            # Extract version number from filename (e.g. 27.03_V55 -> 55)
             try:
                 v_num = int(ad_name.split("_V")[-1])
             except:
-                v_num = i + 1
+                v_num = added + 1
             version = ((v_num - 1) // VIDEOS_PER_CAMPAIGN) + 1
 
-            if done_prompts:
-                meta = done_prompts[i % len(done_prompts)]
-                primary_text = meta.get("primary text", "")
-                headline = meta.get("headline meta", "")
-                prompt = meta.get("prompt", "")
-            else:
-                primary_text = ""
-                headline = ""
-                prompt = ""
+            primary_text = ""
+            headline = ""
+            prompt = ""
 
             for attempt in range(3):
                 try:
@@ -1679,7 +979,7 @@ def fix_sheet(country: str = "USA", date: str = None):
 
             time.sleep(1)
 
-        msg = f"[{c}] fix-sheet {date}: added {added}, skipped {skipped} (already in sheet)"
+        msg = f"[{c}] fix-sheet {date}: added {added}, skipped {skipped}"
         send_telegram(msg)
         return {"status": "ok", "added": added, "skipped": skipped, "total_edited": len(edited_files)}
 
@@ -1688,16 +988,14 @@ def fix_sheet(country: str = "USA", date: str = None):
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
-
 @app.post("/clean-sheet")
-def clean_sheet(country: str = "USA", keep_date: str = "27.03"):
-    """
-    Remove all rows from Master Sheet tab that don't match keep_date.
-    Keeps header row + rows whose Ad_Name starts with keep_date.
-    """
+def clean_sheet(country: str = "USA", keep_date: str = None):
+    """Remove all rows from Master Sheet that don't match keep_date."""
     c = country.upper()
     if c not in COUNTRY_CONFIG:
         return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    if not keep_date:
+        keep_date = datetime.datetime.now().strftime("%d.%m")
 
     c_cfg = COUNTRY_CONFIG[c]
     try:

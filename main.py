@@ -799,11 +799,12 @@ def generate_and_process(country=None):
             total_prompts = len(prompt_queue)
             send_telegram(f"[{c_name}] Starting continuous pipeline: {total_prompts} video(s), {MAX_CONCURRENT} concurrent")
 
-            master_ws = get_or_create_master_tab(gc_fresh, c_cfg["master_tab"])
-            today_prefix = f"{date_du_jour}_V"
-            existing_rows = master_ws.get_all_values()
-            existing_today = len([r for r in existing_rows[1:] if r and r[0].strip().startswith(today_prefix)]) if len(existing_rows) > 1 else 0
-            next_vid_index = existing_today + 1
+            edited_count = len(drive_service.files().list(
+                q=f"'{edited_folder_id}' in parents and trashed=false",
+                fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+            ).execute().get("files", []))
+            next_vid_index = edited_count + 1
+            print(f"  [{c_name}] {edited_count} already edited, starting at V{next_vid_index}")
             vid_index_lock = threading.Lock()
 
             active_tasks = {}

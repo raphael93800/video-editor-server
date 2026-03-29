@@ -841,6 +841,11 @@ def generate_and_process(country=None):
                     return False
                 p_data = prompt_queue.popleft()
                 try:
+                    # Mark processing FIRST so cron never re-picks this prompt
+                    with sheet_lock:
+                        _, gc_proc = get_google_services()
+                        mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
+
                     task_id = kie_generate_video(p_data["prompt"])
                     vid_idx = get_next_vid_index()
                     active_tasks[task_id] = {
@@ -851,20 +856,19 @@ def generate_and_process(country=None):
                         "video_url": None,
                         "elapsed": 0,
                     }
-                    try:
-                        with sheet_lock:
-                            _, gc_proc = get_google_services()
-                            mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
-                    except:
-                        pass
                     print(f"  [{c_name}] Submitted V{vid_idx} (row {p_data['row_index']}), {len(active_tasks)} in flight, {len(prompt_queue)} queued")
                     return True
                 except Exception as e:
-                    prompt_queue.appendleft(p_data)
                     with counters["lock"]:
                         counters["errors"] += 1
                     print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
                     send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
+                    try:
+                        with sheet_lock:
+                            _, gc_err = get_google_services()
+                            mark_prompt_status(gc_err, c_cfg, p_data["row_index"], "error")
+                    except:
+                        pass
                     return False
 
             # Seed the pool — stop on first failure to avoid marking everything processing

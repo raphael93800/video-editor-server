@@ -614,6 +614,11 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
         print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
+        with sheet_lock:
+            _, gc_orig = get_google_services()
+            mark_prompt_status(gc_orig, c_cfg, row_index, "done")
+        print(f"  [{c_name}] V{vid_index} marked done (original uploaded)")
+
         print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
         edit_semaphore.acquire()
         try:
@@ -657,8 +662,8 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
             )
 
         with sheet_lock:
-            _, gc_done = get_google_services()
-            mark_prompt_done(gc_done, c_cfg, row_index)
+            _, gc_ed = get_google_services()
+            mark_prompt_status(gc_ed, c_cfg, row_index, "edited")
         print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
         global last_activity_time
         last_activity_time = time.time()
@@ -1467,7 +1472,10 @@ def debug_state():
                 status_idx = headers.index("status") if "status" in headers else -1
                 prompt_idx = headers.index("prompt") if "prompt" in headers else -1
                 done = 0
+                edited_p = 0
                 ready = 0
+                processing = 0
+                error = 0
                 other = 0
                 for r in all_rows[1:]:
                     has_prompt = prompt_idx >= 0 and prompt_idx < len(r) and r[prompt_idx].strip()
@@ -1476,11 +1484,17 @@ def debug_state():
                     st = r[status_idx].strip().lower() if status_idx >= 0 and status_idx < len(r) else ""
                     if st == "done":
                         done += 1
+                    elif st == "edited":
+                        edited_p += 1
                     elif st == "ready":
                         ready += 1
+                    elif st == "processing":
+                        processing += 1
+                    elif st == "error":
+                        error += 1
                     else:
                         other += 1
-                country_info["prompts"] = {"total": done + ready + other, "done": done, "ready": ready, "other": other}
+                country_info["prompts"] = {"total": done + edited_p + ready + processing + error + other, "ready": ready, "processing": processing, "done": done, "edited": edited_p, "error": error, "other": other}
             except Exception as e:
                 country_info["prompts"] = {"error": str(e)}
 

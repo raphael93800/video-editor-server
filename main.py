@@ -550,7 +550,7 @@ def get_prompts_for_country(gc, country_cfg, limit=None):
             row_dict[h] = row[h_idx].strip() if h_idx < len(row) else ""
 
         status = row_dict.get("status", "").lower()
-        if status == "done":
+        if status != "ready":
             continue
 
         prompt_text = row_dict.get("prompt", "")
@@ -1402,16 +1402,20 @@ def debug_state():
                 status_idx = headers.index("status") if "status" in headers else -1
                 prompt_idx = headers.index("prompt") if "prompt" in headers else -1
                 done = 0
-                not_done = 0
+                ready = 0
+                other = 0
                 for r in all_rows[1:]:
                     has_prompt = prompt_idx >= 0 and prompt_idx < len(r) and r[prompt_idx].strip()
-                    is_done = status_idx >= 0 and status_idx < len(r) and r[status_idx].strip().lower() == "done"
-                    if has_prompt:
-                        if is_done:
-                            done += 1
-                        else:
-                            not_done += 1
-                country_info["prompts"] = {"total": done + not_done, "done": done, "pending": not_done}
+                    if not has_prompt:
+                        continue
+                    st = r[status_idx].strip().lower() if status_idx >= 0 and status_idx < len(r) else ""
+                    if st == "done":
+                        done += 1
+                    elif st == "ready":
+                        ready += 1
+                    else:
+                        other += 1
+                country_info["prompts"] = {"total": done + ready + other, "done": done, "ready": ready, "other": other}
             except Exception as e:
                 country_info["prompts"] = {"error": str(e)}
 

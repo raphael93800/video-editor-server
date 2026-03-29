@@ -1154,7 +1154,7 @@ def reset_flags():
             status_col = headers.index("status") + 1
             for idx, row in enumerate(all_rows[1:], start=2):
                 st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
-                if st == "processing":
+                if st in ("processing", "error"):
                     ws.update_cell(idx, status_col, "READY")
                     reverted += 1
     except Exception as e:

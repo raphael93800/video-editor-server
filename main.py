@@ -912,7 +912,7 @@ def generate_and_process(country=None):
 # ============================================================
 # CRON — check sheet every 60s, auto-launch if prompts found
 # ============================================================
-CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "60"))
+CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "30"))
 cron_enabled = os.environ.get("CRON_ENABLED", "true").lower() == "true"
 
 def has_pending_prompts():

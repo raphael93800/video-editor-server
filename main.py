@@ -614,13 +614,6 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         drive_upload_video(drive_service, local_hook_raw, original_folder_id, orig_filename)
         print(f"  [{c_name}] Original uploaded: {orig_filename}")
 
-        # Mark done NOW so we never re-generate (and re-pay) this video
-        with sheet_lock:
-            _, gc_mark = get_google_services()
-            mark_prompt_done(gc_mark, c_cfg, row_index)
-        print(f"  [{c_name}] V{vid_index} marked done (row {row_index})")
-
-        # Limit concurrent FFmpeg edits to avoid OOM on Render
         print(f"  [{c_name}] V{vid_index} waiting for edit slot...")
         edit_semaphore.acquire()
         try:
@@ -663,6 +656,9 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
                 value_input_option="USER_ENTERED"
             )
 
+        with sheet_lock:
+            _, gc_done = get_google_services()
+            mark_prompt_done(gc_done, c_cfg, row_index)
         print(f"  [{c_name}] V{vid_index} complete (row {row_index})")
         global last_activity_time
         last_activity_time = time.time()
@@ -673,6 +669,12 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
     except Exception as e:
         print(f"  [{c_name}] ERROR editing V{vid_index}: {e}")
         send_telegram(f"[{c_name}] Error V{vid_index} (row {row_index}): {str(e)[:150]}")
+        try:
+            with sheet_lock:
+                _, gc_err = get_google_services()
+                mark_prompt_status(gc_err, c_cfg, row_index, "error")
+        except:
+            pass
         with counters["lock"]:
             counters["errors"] += 1
         task["status"] = "failed"
@@ -875,6 +877,12 @@ def generate_and_process(country=None):
                                 counters["errors"] += 1
                             print(f"  [{c_name}] V{task['vid_index']} generation failed: {err}")
                             send_telegram(f"[{c_name}] V{task['vid_index']} failed: {err[:100]}")
+                            try:
+                                with sheet_lock:
+                                    _, gc_e = get_google_services()
+                                    mark_prompt_status(gc_e, c_cfg, task["prompt_data"]["row_index"], "error")
+                            except:
+                                pass
                             del active_tasks[task_id]
                             submit_next()
 
@@ -887,6 +895,12 @@ def generate_and_process(country=None):
                             counters["errors"] += 1
                         print(f"  [{c_name}] V{task['vid_index']} timed out after {max_wait}s")
                         send_telegram(f"[{c_name}] V{task['vid_index']} timed out")
+                        try:
+                            with sheet_lock:
+                                _, gc_to = get_google_services()
+                                mark_prompt_status(gc_to, c_cfg, task["prompt_data"]["row_index"], "error")
+                        except:
+                            pass
                         del active_tasks[task_id]
                         submit_next()
 

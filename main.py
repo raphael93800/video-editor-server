@@ -32,7 +32,7 @@ GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
 # kie.ai (Veo 3.1) video generation
-KIE_API_KEY         = os.environ.get("KIE_API_KEY",         "be30649990b3e9ee1d9644afeeddccf0")
+KIE_API_KEY         = os.environ.get("KIE_API_KEY",         "2c6b074d932083a007b99a398bbe829c")
 KIE_API_BASE        = "https://api.kie.ai"
 KIE_MODEL           = os.environ.get("KIE_MODEL",           "veo3_fast")
 KIE_ASPECT_RATIO    = "9:16"

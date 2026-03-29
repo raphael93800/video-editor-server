@@ -799,12 +799,20 @@ def generate_and_process(country=None):
             total_prompts = len(prompt_queue)
             send_telegram(f"[{c_name}] Starting continuous pipeline: {total_prompts} video(s), {MAX_CONCURRENT} concurrent")
 
-            edited_count = len(drive_service.files().list(
+            existing_edited = drive_service.files().list(
                 q=f"'{edited_folder_id}' in parents and trashed=false",
-                fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
-            ).execute().get("files", []))
-            next_vid_index = edited_count + 1
-            print(f"  [{c_name}] {edited_count} already edited, starting at V{next_vid_index}")
+                fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+            ).execute().get("files", [])
+            max_v = 0
+            for ef in existing_edited:
+                try:
+                    v_num = int(ef["name"].split("_V")[-1].replace(".mp4", ""))
+                    if v_num > max_v:
+                        max_v = v_num
+                except:
+                    pass
+            next_vid_index = max_v + 1
+            print(f"  [{c_name}] {len(existing_edited)} edited, max V{max_v}, starting at V{next_vid_index}")
             vid_index_lock = threading.Lock()
 
             active_tasks = {}

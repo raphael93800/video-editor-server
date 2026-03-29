@@ -1543,6 +1543,49 @@ def fix_sheet(country: str = "USA", date: str = None):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/clean-sheet")
+def clean_sheet(country: str = "USA", keep_date: str = "27.03"):
+    """
+    Remove all rows from Master Sheet tab that don't match keep_date.
+    Keeps header row + rows whose Ad_Name starts with keep_date.
+    """
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        _, gc = get_google_services()
+        ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        all_rows = ws.get_all_values()
+        if len(all_rows) <= 1:
+            return {"status": "ok", "message": "Sheet is empty", "kept": 0, "removed": 0}
+
+        header = all_rows[0]
+        rows_to_keep = [header]
+        removed = 0
+        for row in all_rows[1:]:
+            ad_name = row[0].strip() if row else ""
+            if ad_name.startswith(keep_date):
+                rows_to_keep.append(row)
+            else:
+                removed += 1
+
+        ws.clear()
+        if rows_to_keep:
+            ws.update(f"A1:H{len(rows_to_keep)}", rows_to_keep, value_input_option="USER_ENTERED")
+
+        kept = len(rows_to_keep) - 1
+        msg = f"[{c}] clean-sheet: kept {kept} rows ({keep_date}), removed {removed}"
+        send_telegram(msg)
+        return {"status": "ok", "kept": kept, "removed": removed}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

@@ -1573,7 +1573,10 @@ def clean_sheet(country: str = "USA", keep_date: str = "27.03"):
 
         ws.clear()
         if rows_to_keep:
-            ws.update(f"A1:H{len(rows_to_keep)}", rows_to_keep, value_input_option="USER_ENTERED")
+            max_cols = max(len(r) for r in rows_to_keep)
+            normalized = [r + [""] * (max_cols - len(r)) for r in rows_to_keep]
+            end_col = chr(ord("A") + max_cols - 1) if max_cols <= 26 else "Z"
+            ws.update(f"A1:{end_col}{len(normalized)}", normalized, value_input_option="USER_ENTERED")
 
         kept = len(rows_to_keep) - 1
         msg = f"[{c}] clean-sheet: kept {kept} rows ({keep_date}), removed {removed}"

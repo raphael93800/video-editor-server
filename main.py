@@ -770,14 +770,11 @@ def generate_and_process(country=None):
                     return idx
 
             def submit_next():
-                """Pop next prompt from queue and submit to kie.ai."""
+                """Pop next prompt from queue and submit to kie.ai. Returns True if added to active_tasks."""
                 if not prompt_queue:
-                    return
+                    return False
                 p_data = prompt_queue.popleft()
                 try:
-                    with sheet_lock:
-                        _, gc_proc = get_google_services()
-                        mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
                     task_id = kie_generate_video(p_data["prompt"])
                     vid_idx = get_next_vid_index()
                     active_tasks[task_id] = {
@@ -788,16 +785,30 @@ def generate_and_process(country=None):
                         "video_url": None,
                         "elapsed": 0,
                     }
+                    try:
+                        with sheet_lock:
+                            _, gc_proc = get_google_services()
+                            mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
+                    except:
+                        pass
                     print(f"  [{c_name}] Submitted V{vid_idx} (row {p_data['row_index']}), {len(active_tasks)} in flight, {len(prompt_queue)} queued")
+                    return True
                 except Exception as e:
+                    prompt_queue.appendleft(p_data)
                     with counters["lock"]:
                         counters["errors"] += 1
                     print(f"  [{c_name}] Failed to submit row {p_data['row_index']}: {e}")
                     send_telegram(f"[{c_name}] Submit error row {p_data['row_index']}: {str(e)[:150]}")
+                    return False
 
-            # Seed the pool
-            while prompt_queue and len(active_tasks) < MAX_CONCURRENT:
-                submit_next()
+            # Seed the pool — stop on first failure to avoid marking everything processing
+            consecutive_fails = 0
+            while prompt_queue and len(active_tasks) < MAX_CONCURRENT and consecutive_fails < 3:
+                if submit_next():
+                    consecutive_fails = 0
+                else:
+                    consecutive_fails += 1
+                    time.sleep(5)
 
             if not active_tasks:
                 print(f"  [{c_name}] All submissions failed")
@@ -1059,15 +1070,37 @@ def status():
 
 @app.post("/reset")
 def reset_flags():
-    """Force reset generating/reediting flags when pipeline is stuck."""
+    """Force reset generating/reediting flags + revert stuck 'processing' prompts back to 'READY'."""
     global is_generating, is_reediting, last_activity_time
     was_gen = is_generating
     was_reedit = is_reediting
     is_generating = False
     is_reediting = False
     last_activity_time = time.time()
-    send_telegram(f"Manual reset: generating {was_gen}->False, reediting {was_reedit}->False")
-    return {"status": "ok", "was_generating": was_gen, "was_reediting": was_reedit}
+
+    reverted = 0
+    try:
+        _, gc = get_google_services()
+        for c_name, c_cfg in COUNTRY_CONFIG.items():
+            ss = gc.open_by_key(PROMPTS_SHEET_ID)
+            ws = ss.worksheet(c_cfg["prompt_tab"])
+            all_rows = ws.get_all_values()
+            if not all_rows:
+                continue
+            headers = [h.strip().lower() for h in all_rows[0]]
+            if "status" not in headers:
+                continue
+            status_col = headers.index("status") + 1
+            for idx, row in enumerate(all_rows[1:], start=2):
+                st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
+                if st == "processing":
+                    ws.update_cell(idx, status_col, "READY")
+                    reverted += 1
+    except Exception as e:
+        print(f"Reset revert error: {e}")
+
+    send_telegram(f"Manual reset: generating {was_gen}->False, reediting {was_reedit}->False, reverted {reverted} processing->READY")
+    return {"status": "ok", "was_generating": was_gen, "was_reediting": was_reedit, "reverted_to_ready": reverted}
 
 @app.post("/generate")
 def trigger_generate(background_tasks: BackgroundTasks, country: str = None):

@@ -114,12 +114,38 @@ def drive_get_or_create_folder(drive_service, parent_id, folder_name):
     return created["id"]
 
 def drive_upload_video(drive_service, local_path, parent_id, filename):
-    media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True)
-    meta = {"name": filename, "parents": [parent_id]}
-    created = drive_service.files().create(
-        body=meta, media_body=media, fields="id", supportsAllDrives=True
-    ).execute()
-    return created["id"]
+    file_size = os.path.getsize(local_path)
+    for attempt in range(3):
+        try:
+            if file_size < 5 * 1024 * 1024:
+                media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=False)
+            else:
+                media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True, chunksize=5*1024*1024)
+            meta = {"name": filename, "parents": [parent_id]}
+            req = drive_service.files().create(
+                body=meta, media_body=media, fields="id", supportsAllDrives=True
+            )
+            if file_size < 5 * 1024 * 1024:
+                created = req.execute()
+            else:
+                response = None
+                while response is None:
+                    try:
+                        _, response = req.next_chunk()
+                    except Exception as chunk_err:
+                        if "200" in str(chunk_err):
+                            response = req.execute()
+                            break
+                        raise
+                created = response
+            return created["id"]
+        except Exception as e:
+            print(f"  Upload attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(3)
+                drive_service, _ = get_google_services()
+            else:
+                raise
 
 def make_drive_links(file_id):
     share_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
@@ -509,12 +535,23 @@ def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
     raise Exception(f"kie.ai timeout after {max_wait}s for task {task_id}")
 
 def kie_download_video(url: str, local_path: str):
-    resp = http_requests.get(url, stream=True, timeout=120)
-    resp.raise_for_status()
-    with open(local_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print(f"  kie.ai video downloaded: {local_path}")
+    for attempt in range(3):
+        try:
+            resp = http_requests.get(url, stream=True, timeout=120)
+            resp.raise_for_status()
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if os.path.getsize(local_path) < 1000:
+                raise Exception(f"Downloaded file too small: {os.path.getsize(local_path)} bytes")
+            print(f"  kie.ai video downloaded: {local_path}")
+            return
+        except Exception as e:
+            print(f"  kie.ai download attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(5)
+            else:
+                raise
 
 # ============================================================
 # PROMPT SHEET — read prompts per country

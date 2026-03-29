@@ -1057,6 +1057,18 @@ def status():
         "last_activity_seconds_ago": stale,
     }
 
+@app.post("/reset")
+def reset_flags():
+    """Force reset generating/reediting flags when pipeline is stuck."""
+    global is_generating, is_reediting, last_activity_time
+    was_gen = is_generating
+    was_reedit = is_reediting
+    is_generating = False
+    is_reediting = False
+    last_activity_time = time.time()
+    send_telegram(f"Manual reset: generating {was_gen}->False, reediting {was_reedit}->False")
+    return {"status": "ok", "was_generating": was_gen, "was_reediting": was_reedit}
+
 @app.post("/generate")
 def trigger_generate(background_tasks: BackgroundTasks, country: str = None):
     """

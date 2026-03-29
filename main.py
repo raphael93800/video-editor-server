@@ -678,8 +678,16 @@ def process_ready_video_thread(task, drive_service, c_name, c_cfg,
         if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
             raise Exception(f"Edited file missing or too small ({os.path.getsize(local_edited) if local_edited and os.path.exists(local_edited) else 0} bytes)")
 
-        out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
-        print(f"  [{c_name}] Edited uploaded: {nom_final}")
+        dup_check = drive_service.files().list(
+            q=f"'{edited_folder_id}' in parents and trashed=false and name='{nom_final}'",
+            fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute().get("files", [])
+        if dup_check:
+            print(f"  [{c_name}] {nom_final} already exists in edited/, skipping upload")
+            out_id = dup_check[0]["id"]
+        else:
+            out_id = drive_upload_video(drive_service, local_edited, edited_folder_id, nom_final)
+            print(f"  [{c_name}] Edited uploaded: {nom_final}")
 
         version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
         campaign_name = f"C{date_du_jour}_{c_name}_{version:02d}"

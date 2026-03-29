@@ -570,14 +570,17 @@ def get_prompts_for_country(gc, country_cfg, limit=None):
 
     return prompts
 
-def mark_prompt_done(gc, country_cfg, row_index):
+def mark_prompt_status(gc, country_cfg, row_index, status):
     prompt_tab = country_cfg["prompt_tab"]
     spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
     ws = spreadsheet.worksheet(prompt_tab)
     headers = [h.strip().lower() for h in ws.row_values(1)]
     if "status" in headers:
         col = headers.index("status") + 1
-        ws.update_cell(row_index, col, "done")
+        ws.update_cell(row_index, col, status)
+
+def mark_prompt_done(gc, country_cfg, row_index):
+    mark_prompt_status(gc, country_cfg, row_index, "done")
 
 # ============================================================
 # CONTINUOUS PIPELINE — pool of N concurrent generations,
@@ -772,6 +775,9 @@ def generate_and_process(country=None):
                     return
                 p_data = prompt_queue.popleft()
                 try:
+                    with sheet_lock:
+                        _, gc_proc = get_google_services()
+                        mark_prompt_status(gc_proc, c_cfg, p_data["row_index"], "processing")
                     task_id = kie_generate_video(p_data["prompt"])
                     vid_idx = get_next_vid_index()
                     active_tasks[task_id] = {

@@ -736,7 +736,7 @@ def full_pipeline(country="USA"):
                              f"C{date_str}_{country}_{version:02d}",
                              f"adset{version}_{country}_{date_str}",
                              p_data["primary_text"], p_data["headline_meta"], prompt_text,
-                             "ready", "video", ""],
+                             "pending", "video", ""],
                             value_input_option="USER_ENTERED"
                         )
                         break
@@ -861,7 +861,7 @@ def reconcile_master_sheet(country="USA"):
                         [ad_name, drive_link, direct_link,
                          f"C{date_str}_{country}_{version:02d}",
                          f"adset{version}_{country}_{date_str}",
-                         "", "", "", "ready", "video", ""],
+                         "", "", "", "pending", "video", ""],
                         value_input_option="USER_ENTERED"
                     )
                     added += 1

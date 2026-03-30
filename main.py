@@ -1096,6 +1096,26 @@ def clean_sheet(country: str = "USA", keep_date: str = None):
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/check-sheet")
+def check_sheet(country: str = "USA"):
+    """Debug: show raw sheet headers and first few rows."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return {"error": f"Unknown country: {c}"}
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        _, gc = get_google_services()
+        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        ws = ss.worksheet(c_cfg["prompt_tab"])
+        all_rows = ws.get_all_values()
+        headers = all_rows[0] if all_rows else []
+        rows_preview = []
+        for i, row in enumerate(all_rows[1:6], start=2):
+            rows_preview.append({"row": i, "values": row})
+        return {"headers": headers, "headers_lower": [h.strip().lower() for h in headers], "rows": rows_preview, "total_rows": len(all_rows) - 1}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/add-prompts")
 def add_prompts(country: str = "USA", count: int = 2):
     """Write test prompts to the sheet with status READY."""

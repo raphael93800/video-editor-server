@@ -785,11 +785,12 @@ def full_pipeline(country="USA"):
 
         send_telegram(f"[{country}] Pipeline done: {total_success} OK, {total_errors} errors out of {len(prompts)}")
 
-        # Reconciliation: ensure Master Sheet has all edited videos
-        try:
-            reconcile_master_sheet(country)
-        except Exception as re:
-            print(f"[{country}] Reconciliation failed: {re}")
+        # Reconciliation disabled — pipeline already adds entries to Master Sheet
+        # and reconciliation causes duplicate/out-of-order entries
+        # try:
+        #     reconcile_master_sheet(country)
+        # except Exception as re:
+        #     print(f"[{country}] Reconciliation failed: {re}")
 
     except Exception as e:
         print(f"[{country}] Pipeline critical error: {e}")

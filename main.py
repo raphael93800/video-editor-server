@@ -380,18 +380,6 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
             os.remove(local_audio)
 
         title_clean = video_title.replace("\n", " ").strip()
-        words_t = title_clean.split()
-        line1, line2 = "", ""
-        mid = len(words_t) // 2
-        for cut in range(mid, len(words_t)):
-            candidate1 = " ".join(words_t[:cut])
-            candidate2 = " ".join(words_t[cut:])
-            if len(candidate1) <= 22:
-                line1, line2 = candidate1, candidate2
-                break
-        if not line1:
-            line1 = title_clean
-            line2 = ""
 
         def esc(s):
             return (s.replace("\\", "\\\\")
@@ -399,24 +387,48 @@ def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_
                      .replace(":", "\\:")
                      .replace("%", "%%"))
 
+        def split_title_lines(text, max_chars=28):
+            words = text.split()
+            if len(text) <= max_chars:
+                return [text]
+            # Try 2 lines
+            for cut in range(len(words) // 2, len(words)):
+                l1 = " ".join(words[:cut])
+                l2 = " ".join(words[cut:])
+                if len(l1) <= max_chars and len(l2) <= max_chars:
+                    return [l1, l2]
+            # Try 3 lines
+            for c1 in range(1, len(words) - 1):
+                for c2 in range(c1 + 1, len(words)):
+                    l1 = " ".join(words[:c1])
+                    l2 = " ".join(words[c1:c2])
+                    l3 = " ".join(words[c2:])
+                    if len(l1) <= max_chars and len(l2) <= max_chars and len(l3) <= max_chars:
+                        return [l1, l2, l3]
+            return [text]
+
+        title_lines = split_title_lines(title_clean)
+        num_lines = len(title_lines)
+        font_size = 46 if num_lines <= 2 else 40
+        line_height = font_size + 18
+
         if os.path.exists(FONT_PATH):
             font_path_esc = FONT_PATH.replace(':', '\\:')
-            font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize=50"
+            font_base = f"fontfile={font_path_esc}:fontcolor=black:fontsize={font_size}"
         else:
-            font_base = "fontcolor=black:fontsize=50"
+            font_base = f"fontcolor=black:fontsize={font_size}"
 
-        if line2:
-            title_filter = (
-                f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=780:"
-                f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)',"
-                f"drawtext=text='{esc(line2)}':{font_base}:x=(w-tw)/2:y=848:"
+        total_height = num_lines * line_height
+        start_y = 810 - total_height // 2
+
+        title_parts = []
+        for i, line in enumerate(title_lines):
+            y = start_y + i * line_height
+            title_parts.append(
+                f"drawtext=text='{esc(line)}':{font_base}:x=(w-tw)/2:y={y}:"
                 f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
             )
-        else:
-            title_filter = (
-                f"drawtext=text='{esc(line1)}':{font_base}:x=(w-tw)/2:y=800:"
-                f"box=1:boxcolor=white@1.0:boxborderw=12:enable='lt(t,4)'"
-            )
+        title_filter = ",".join(title_parts)
 
         sub_filters = build_subtitle_drawtext_filters(local_srt, FONT_PATH)
         all_filters = [title_filter] + sub_filters

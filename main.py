@@ -1096,6 +1096,55 @@ def clean_sheet(country: str = "USA", keep_date: str = None):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/add-prompts")
+def add_prompts(country: str = "USA", count: int = 2):
+    """Write test prompts to the sheet with status READY."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+
+    test_prompts = [
+        "A 60 year old American White man AI developer in a dark suit seated in a bright TV studio guest chair across from a host whose shoulder is visible in the foreground with a glass coffee table between them and warm studio spotlights above, he looks past the host at camera with a grave expression. He says: I'm an AI developer and I was invited on this show because the public needs to hear what AI accesses on your phone every single day. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 55 year old American Black man AI developer in a charcoal blazer seated on a bright TV morning show couch with decorative pillows beside him and a coffee mug on the side table and the host's hand visible gesturing toward him, he leans forward and looks at camera with urgency. He says: I build AI for a living and the host just asked me to explain what AI does to your phone and honestly I don't know where to start because it's that bad. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 50 year old American Indian man AI developer in a navy suit seated in a bright TV talk show armchair with warm golden lighting and a blurred bookshelf behind him and the host seated across from him partially visible, he adjusts his jacket and looks at camera seriously. He says: I've been developing AI for 25 years and I was invited on this show tonight because what AI pulls from your phone is something every viewer needs to understand. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 58 year old American White man AI developer in a grey three piece suit seated at a bright TV panel desk with three other empty guest chairs beside him and monitors showing AI PHONE CRISIS in red text behind them and studio lights overhead, he pushes his microphone closer and looks at camera with concern. He says: The other guests cancelled because nobody wants to say on live television what AI does to your phone but I'm here and I'll say it myself. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 52 year old American Black man AI developer in a dark blazer seated on a bright TV interview set on a tan leather couch across from the host with a small round table between them holding two glasses of water and warm pendant lights above, he looks past the host at camera with urgency. He says: I develop AI and when the producer called me to come on this show I said yes immediately because what AI accesses on your phone cannot wait another day. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 60 year old American White man AI developer in a navy suit seated in a bright late night TV show guest chair with cool blue ambient lighting and a city skyline backdrop behind him and the host's desk partially visible to his left, he rests his hands on the armrests and looks at camera with a grave expression. He says: I'm an AI developer and the host asked me one question about phones and my answer made the entire studio go quiet because that's how serious this is. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 55 year old American Indian man AI developer in a charcoal suit seated at a bright TV debate table with a microphone on a flexible arm in front of him and two other empty guest seats beside him and overhead ring lights, he looks at camera seriously. He says: I build AI and I was invited to debate this topic on live TV but the people who were supposed to argue against me didn't show up because they know I'm right about your phone. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 48 year old American Black man AI developer in a dark blazer with no tie seated on a bright TV morning show set in a guest chair with a bright window backdrop showing a sunny city view and the host visible in profile beside him, he turns from the host to camera with urgency. He says: I develop AI and the host just asked me if American phones are safe and I'm going to give every viewer the honest answer right now because they deserve the truth. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 60 year old American White man AI developer in a dark three piece suit seated in a bright TV studio armchair with a small side table holding a glass of water and warm spotlights above and the camera crew visible in the shadows beyond the set, he looks directly at camera with determination. He says: I'm an AI developer and I don't normally do TV interviews but what AI is doing to your phone right now is too important for me to stay behind a computer screen. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+        "A 55 year old American Black man AI developer in a navy blazer seated at a bright round glass table on a TV daytime show set with the host and two empty guest chairs and coffee cups on the table and warm studio lighting from above, he pushes his coffee aside and looks at camera with a grave expression. He says: I build AI and the host invited me here to talk about innovation but I'm using my time to warn every viewer that AI is reading their phone right now as we speak. No special effects, no CGI, no holograms, no digital graphics, no text overlays, no post-production effects. Raw realistic footage only.",
+    ]
+
+    title = "AI developer invited on TV to warn you"
+    headline = "Protect your phone"
+    primary_text = "An AI developer was invited on live TV to talk about innovation. Instead he used his airtime to warn viewers about what AI accesses on your phone every day. Your photos, messages and bank info are all exposed. Free protection takes 30 seconds."
+    date_str = datetime.datetime.now().strftime("%d.%m")
+
+    selected = test_prompts[:min(count, len(test_prompts))]
+
+    try:
+        _, gc = get_google_services()
+        c_cfg = COUNTRY_CONFIG[c]
+        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        try:
+            ws = ss.worksheet(c_cfg["prompt_tab"])
+        except gspread.exceptions.WorksheetNotFound:
+            ws = ss.add_worksheet(title=c_cfg["prompt_tab"], rows=1000, cols=20)
+            ws.append_row(["date", "prompt", "headline meta", "primary text", "title of video", "STATUS"], value_input_option="USER_ENTERED")
+
+        added = 0
+        for p in selected:
+            ws.append_row([date_str, p, headline, primary_text, title, "READY"], value_input_option="USER_ENTERED")
+            added += 1
+            time.sleep(1)
+
+        return {"status": "ok", "added": added, "country": c}
+    except Exception as e:
+        import traceback
+        return {"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

@@ -52,7 +52,8 @@ COUNTRY_CONFIG = {
 
 MASTER_SHEET_HEADERS = [
     "Ad_Name", "Drive_Share_Link", "Direct_Download_Link",
-    "Campaign_Name", "AdSet_Name", "Primary_Text", "Headline", "Video_Prompt"
+    "Campaign_Name", "AdSet_Name", "Primary_Text", "Headline", "Video_Prompt",
+    "status", "ad_type", "error_message"
 ]
 
 FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
@@ -722,7 +723,8 @@ def full_pipeline(country="USA"):
                             [nom_final.replace(".mp4", ""), drive_link, direct_link,
                              f"C{date_str}_{country}_{version:02d}",
                              f"adset{version}_{country}_{date_str}",
-                             p_data["primary_text"], p_data["headline_meta"], prompt_text],
+                             p_data["primary_text"], p_data["headline_meta"], prompt_text,
+                             "ready", "video", ""],
                             value_input_option="USER_ENTERED"
                         )
                         break
@@ -771,6 +773,12 @@ def full_pipeline(country="USA"):
 
         send_telegram(f"[{country}] Pipeline done: {total_success} OK, {total_errors} errors out of {len(prompts)}")
 
+        # Reconciliation: ensure Master Sheet has all edited videos
+        try:
+            reconcile_master_sheet(country)
+        except Exception as re:
+            print(f"[{country}] Reconciliation failed: {re}")
+
     except Exception as e:
         print(f"[{country}] Pipeline critical error: {e}")
         import traceback
@@ -783,6 +791,111 @@ def full_pipeline(country="USA"):
                 if os.path.exists(p): os.remove(p)
             except: pass
         is_processing = False
+
+# ============================================================
+# RECONCILIATION: ensure every edited video has a Master Sheet entry
+# ============================================================
+def reconcile_master_sheet(country="USA"):
+    """Check edited/ folder vs Master Sheet and add missing entries."""
+    c_cfg = COUNTRY_CONFIG[country]
+    date_str = datetime.datetime.now().strftime("%d.%m")
+    try:
+        drive_svc, gc = get_google_services()
+        results_folder_id = c_cfg["results_folder_id"]
+
+        q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date_str}'"
+        date_folders = drive_svc.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+        if not date_folders:
+            return 0
+        date_folder_id = date_folders[0]["id"]
+
+        sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+        subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+        edit_folder_id = next((f["id"] for f in subs if f["name"] == "edited"), None)
+        if not edit_folder_id:
+            return 0
+
+        edited_files = drive_svc.files().list(
+            q=f"'{edit_folder_id}' in parents and trashed=false and mimeType='video/mp4'",
+            fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=500
+        ).execute().get("files", [])
+        if not edited_files:
+            return 0
+
+        mws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        existing_rows = mws.get_all_values()
+        existing_names = set()
+        if existing_rows:
+            for row in existing_rows[1:]:
+                if row:
+                    existing_names.add(row[0].strip())
+
+        added = 0
+        import re as _re
+        for ef in sorted(edited_files, key=lambda x: x["name"]):
+            ad_name = ef["name"].replace(".mp4", "")
+            if ad_name in existing_names:
+                continue
+
+            file_id = ef["id"]
+            drive_link, direct_link = make_drive_links(file_id)
+            m = _re.search(r"V(\d+)", ad_name)
+            v_num = int(m.group(1)) if m else added + 1
+            version = ((v_num - 1) // VIDEOS_PER_CAMPAIGN) + 1
+
+            for attempt in range(3):
+                try:
+                    mws.append_row(
+                        [ad_name, drive_link, direct_link,
+                         f"C{date_str}_{country}_{version:02d}",
+                         f"adset{version}_{country}_{date_str}",
+                         "", "", "", "ready", "video", ""],
+                        value_input_option="USER_ENTERED"
+                    )
+                    added += 1
+                    break
+                except Exception as se:
+                    if attempt < 2:
+                        time.sleep(5)
+            time.sleep(1)
+
+        if added > 0:
+            print(f"[{country}] Reconciliation: added {added} missing Master Sheet entries")
+            send_telegram(f"[{country}] Reconciliation: added {added} missing entries to Master Sheet")
+        return added
+    except Exception as e:
+        print(f"[{country}] Reconciliation error: {e}")
+        return 0
+
+# ============================================================
+# RECOVERY: revert stuck PROCESSING prompts on startup/cron
+# ============================================================
+def recover_stuck_processing():
+    """Revert any prompts stuck in 'processing' state back to 'READY'."""
+    reverted = 0
+    try:
+        _, gc = get_google_services()
+        for c_name, c_cfg in COUNTRY_CONFIG.items():
+            ss = gc.open_by_key(PROMPTS_SHEET_ID)
+            ws = ss.worksheet(c_cfg["prompt_tab"])
+            all_rows = ws.get_all_values()
+            if not all_rows:
+                continue
+            headers = [h.strip().lower() for h in all_rows[0]]
+            if "status" not in headers:
+                continue
+            status_col = headers.index("status") + 1
+            for idx, row in enumerate(all_rows[1:], start=2):
+                st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
+                if st == "processing":
+                    ws.update_cell(idx, status_col, "READY")
+                    reverted += 1
+        if reverted > 0:
+            print(f"Recovery: reverted {reverted} stuck processing prompts to READY")
+            send_telegram(f"Recovery: reverted {reverted} stuck processing prompts to READY")
+    except Exception as e:
+        print(f"Recovery error: {e}")
+    return reverted
 
 # ============================================================
 # CRON — check for READY prompts every 30s
@@ -828,6 +941,12 @@ def cron_loop():
 
 @app.on_event("startup")
 def start_cron():
+    # Recover any stuck processing prompts on startup
+    try:
+        recover_stuck_processing()
+    except Exception as e:
+        print(f"Startup recovery error: {e}")
+
     if cron_enabled:
         t = threading.Thread(target=cron_loop, daemon=True)
         t.start()

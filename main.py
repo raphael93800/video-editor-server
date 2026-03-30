@@ -1116,6 +1116,25 @@ def check_sheet(country: str = "USA"):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/clear-prompts")
+def clear_prompts(country: str = "USA"):
+    """Remove all non-header rows from the prompt sheet tab."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        _, gc = get_google_services()
+        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        ws = ss.worksheet(c_cfg["prompt_tab"])
+        all_rows = ws.get_all_values()
+        if len(all_rows) > 1:
+            ws.resize(rows=1)
+            ws.resize(rows=1000)
+        return {"status": "ok", "removed": len(all_rows) - 1}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/add-prompts")
 def add_prompts(country: str = "USA", count: int = 2):
     """Write test prompts to the sheet with status READY."""
@@ -1153,9 +1172,27 @@ def add_prompts(country: str = "USA", count: int = 2):
             ws = ss.add_worksheet(title=c_cfg["prompt_tab"], rows=1000, cols=20)
             ws.append_row(["date", "prompt", "headline meta", "primary text", "title of video", "STATUS"], value_input_option="USER_ENTERED")
 
+        headers = [h.strip().lower() for h in ws.row_values(1)]
+        col_map = {}
+        for i, h in enumerate(headers):
+            col_map[h] = i
+
         added = 0
         for p in selected:
-            ws.append_row([date_str, p, headline, primary_text, title, "READY"], value_input_option="USER_ENTERED")
+            row_data = [""] * len(headers)
+            if "date" in col_map:
+                row_data[col_map["date"]] = date_str
+            if "prompt" in col_map:
+                row_data[col_map["prompt"]] = p
+            if "headline meta" in col_map:
+                row_data[col_map["headline meta"]] = headline
+            if "primary text" in col_map:
+                row_data[col_map["primary text"]] = primary_text
+            if "title of video" in col_map:
+                row_data[col_map["title of video"]] = title
+            if "status" in col_map:
+                row_data[col_map["status"]] = "READY"
+            ws.append_row(row_data, value_input_option="USER_ENTERED")
             added += 1
             time.sleep(1)
 

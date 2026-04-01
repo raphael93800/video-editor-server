@@ -785,12 +785,10 @@ def full_pipeline(country="USA"):
 
         send_telegram(f"[{country}] Pipeline done: {total_success} OK, {total_errors} errors out of {len(prompts)}")
 
-        # Reconciliation disabled — pipeline already adds entries to Master Sheet
-        # and reconciliation causes duplicate/out-of-order entries
-        # try:
-        #     reconcile_master_sheet(country)
-        # except Exception as re:
-        #     print(f"[{country}] Reconciliation failed: {re}")
+        try:
+            reconcile_master_sheet(country)
+        except Exception as re:
+            print(f"[{country}] Reconciliation failed: {re}")
 
     except Exception as e:
         print(f"[{country}] Pipeline critical error: {e}")
@@ -809,7 +807,7 @@ def full_pipeline(country="USA"):
 # RECONCILIATION: ensure every edited video has a Master Sheet entry
 # ============================================================
 def reconcile_master_sheet(country="USA"):
-    """Check edited/ folder vs Master Sheet and add missing entries."""
+    """Check edited/ folder vs Master Sheet and add missing entries with prompt data."""
     c_cfg = COUNTRY_CONFIG[country]
     date_str = datetime.datetime.now().strftime("%d.%m")
     try:
@@ -843,6 +841,31 @@ def reconcile_master_sheet(country="USA"):
                 if row:
                     existing_names.add(row[0].strip())
 
+        # Load prompt sheet data to fill in missing fields
+        prompt_data_map = {}
+        try:
+            ss = gc.open_by_key(PROMPTS_SHEET_ID)
+            ws = ss.worksheet(c_cfg["prompt_tab"])
+            p_rows = ws.get_all_values()
+            if p_rows:
+                p_headers = [h.strip().lower() for h in p_rows[0]]
+                for pr in p_rows[1:]:
+                    p_dict = {p_headers[j]: pr[j] for j in range(min(len(p_headers), len(pr)))}
+                    s = p_dict.get("status", "").strip().upper()
+                    if s == "DONE":
+                        prompt_text = p_dict.get("prompt", "")
+                        if prompt_text and prompt_text not in prompt_data_map:
+                            prompt_data_map[prompt_text] = {
+                                "primary_text": p_dict.get("primary text", p_dict.get("primary_text", "")),
+                                "headline": p_dict.get("headline meta", p_dict.get("headline", "")),
+                                "title": p_dict.get("title of video", p_dict.get("title", "")),
+                                "prompt": prompt_text,
+                            }
+        except Exception as pe:
+            print(f"[{country}] Reconciliation: could not load prompt data: {pe}")
+
+        prompt_list = list(prompt_data_map.values())
+
         added = 0
         import re as _re
         for ef in sorted(edited_files, key=lambda x: x["name"]):
@@ -856,13 +879,20 @@ def reconcile_master_sheet(country="USA"):
             v_num = int(m.group(1)) if m else added + 1
             version = ((v_num - 1) // VIDEOS_PER_CAMPAIGN) + 1
 
+            # Try to match prompt by V number (V1 = prompt 0, V2 = prompt 1, etc.)
+            p_info = prompt_list[v_num - 1] if v_num <= len(prompt_list) else {}
+            primary_text = p_info.get("primary_text", "")
+            headline = p_info.get("headline", "")
+            prompt_text = p_info.get("prompt", "")
+
             for attempt in range(3):
                 try:
                     mws.append_row(
                         [ad_name, drive_link, direct_link,
                          f"C{date_str}_{country}_{version:02d}",
                          f"adset{version}_{country}_{date_str}",
-                         "", "", "", "pending", "video", ""],
+                         primary_text, headline, prompt_text,
+                         "pending", "video", ""],
                         value_input_option="USER_ENTERED"
                     )
                     added += 1

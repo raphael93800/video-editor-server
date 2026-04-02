@@ -589,14 +589,31 @@ def get_prompts_for_country(gc, country_cfg, limit=5):
 
     return prompts
 
-def mark_prompt_status(gc, country_cfg, row_index, status):
+def mark_prompt_status(gc, country_cfg, row_index, status, prompt_text=None):
+    """Update prompt status. If prompt_text is given, find the row by matching
+    the prompt content instead of relying on a potentially stale row_index."""
     prompt_tab = country_cfg["prompt_tab"]
     spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
     ws = spreadsheet.worksheet(prompt_tab)
     headers = [h.strip().lower() for h in ws.row_values(1)]
-    if "status" in headers:
-        col = headers.index("status") + 1
-        ws.update_cell(row_index, col, status)
+    if "status" not in headers:
+        return
+    status_col = headers.index("status") + 1
+
+    if prompt_text and "prompt" in headers:
+        prompt_col = headers.index("prompt")
+        all_rows = ws.get_all_values()
+        found = False
+        for idx, row in enumerate(all_rows[1:], start=2):
+            cell_prompt = row[prompt_col].strip() if prompt_col < len(row) else ""
+            if cell_prompt == prompt_text.strip():
+                ws.update_cell(idx, status_col, status)
+                found = True
+                break
+        if not found:
+            print(f"  mark_prompt_status: prompt not found in sheet, skipping update")
+    else:
+        ws.update_cell(row_index, status_col, status)
 
 # ============================================================
 # FULL PIPELINE: read prompts -> generate -> edit -> upload -> log
@@ -684,10 +701,27 @@ def full_pipeline(country="USA"):
             local_edited = None
 
             try:
-                # Mark processing
+                # Re-check that prompt is still READY before processing
                 with sheet_lock:
                     _, gc_s = get_google_services()
-                    mark_prompt_status(gc_s, c_cfg, row_index, "processing")
+                    ss_check = gc_s.open_by_key(PROMPTS_SHEET_ID)
+                    ws_check = ss_check.worksheet(c_cfg["prompt_tab"])
+                    all_current = ws_check.get_all_values()
+                    h_check = [h.strip().lower() for h in all_current[0]] if all_current else []
+                    prompt_col = h_check.index("prompt") if "prompt" in h_check else -1
+                    status_col_idx = h_check.index("status") if "status" in h_check else -1
+                    still_ready = False
+                    for cr in all_current[1:]:
+                        cp = cr[prompt_col].strip() if prompt_col >= 0 and prompt_col < len(cr) else ""
+                        cs = cr[status_col_idx].strip().lower() if status_col_idx >= 0 and status_col_idx < len(cr) else ""
+                        if cp == prompt_text.strip() and cs == "ready":
+                            still_ready = True
+                            break
+                    if not still_ready:
+                        print(f"  [{country}] V{vid_index} (row {row_index}): prompt no longer READY, skipping")
+                        vid_index += 1
+                        continue
+                    mark_prompt_status(gc_s, c_cfg, row_index, "processing", prompt_text=prompt_text)
                 print(f"  [{country}] V{vid_index} (row {row_index}): generating...")
 
                 # Generate via Kie.ai
@@ -750,7 +784,7 @@ def full_pipeline(country="USA"):
                 # Mark done
                 with sheet_lock:
                     _, gc_d = get_google_services()
-                    mark_prompt_status(gc_d, c_cfg, row_index, "done")
+                    mark_prompt_status(gc_d, c_cfg, row_index, "done", prompt_text=prompt_text)
 
                 total_success += 1
                 last_activity_time = time.time()
@@ -767,7 +801,7 @@ def full_pipeline(country="USA"):
                 try:
                     with sheet_lock:
                         _, gc_e = get_google_services()
-                        mark_prompt_status(gc_e, c_cfg, row_index, "error")
+                        mark_prompt_status(gc_e, c_cfg, row_index, "error", prompt_text=prompt_text)
                 except:
                     pass
                 vid_index += 1

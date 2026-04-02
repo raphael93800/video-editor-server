@@ -693,9 +693,24 @@ def full_pipeline(country="USA"):
             nom_final = f"{date_str}_V{vid_index}.mp4"
 
             if nom_final in edited_names:
-                print(f"  [{country}] Skipping V{vid_index}: already exists")
+                print(f"  [{country}] Skipping V{vid_index}: already exists (cached)")
                 vid_index += 1
                 continue
+
+            # Re-check Drive in real-time to avoid duplicates from concurrent runs
+            try:
+                dup_q = f"'{edited_folder_id}' in parents and trashed=false and name='{nom_final}'"
+                dup_check = drive_svc.files().list(
+                    q=dup_q, fields="files(id)", supportsAllDrives=True,
+                    includeItemsFromAllDrives=True, pageSize=1
+                ).execute().get("files", [])
+                if dup_check:
+                    print(f"  [{country}] Skipping V{vid_index}: already exists on Drive (live check)")
+                    edited_names.add(nom_final)
+                    vid_index += 1
+                    continue
+            except Exception as dup_err:
+                print(f"  [{country}] Drive dup check error (continuing): {dup_err}")
 
             local_raw = f"/tmp/gen_{country}_{vid_index}.mp4"
             local_edited = None
@@ -755,6 +770,7 @@ def full_pipeline(country="USA"):
 
                 # Upload edited
                 out_id = drive_upload_video(drive_svc, local_edited, edited_folder_id, nom_final)
+                edited_names.add(nom_final)
                 print(f"  [{country}] V{vid_index}: edited uploaded")
 
                 # Log to Master Sheet

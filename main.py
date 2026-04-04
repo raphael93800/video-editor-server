@@ -1514,35 +1514,41 @@ def distribute_prompts():
                 print(f"  [{SERVER_ID}] Created tab {tab_name}")
             target_worksheets.append(ws)
 
-        counts = {tab: 0 for tab in DISTRIBUTE_TABS}
+        batches = {tab: [] for tab in DISTRIBUTE_TABS}
         for i, row in enumerate(ready_rows):
             target_idx = i % len(DISTRIBUTE_TABS)
             tab_name = DISTRIBUTE_TABS[target_idx]
-            ws = target_worksheets[target_idx]
-
             row_copy = list(row)
             if status_col_idx < len(row_copy):
                 row_copy[status_col_idx] = "READY"
+            batches[tab_name].append(row_copy)
 
+        counts = {}
+        for tab_idx, tab_name in enumerate(DISTRIBUTE_TABS):
+            rows_to_add = batches[tab_name]
+            if not rows_to_add:
+                counts[tab_name] = 0
+                continue
+            ws = target_worksheets[tab_idx]
             for attempt in range(3):
                 try:
-                    ws.append_row(row_copy, value_input_option="USER_ENTERED")
-                    counts[tab_name] += 1
+                    ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+                    counts[tab_name] = len(rows_to_add)
                     break
                 except Exception as e:
                     if attempt < 2:
-                        time.sleep(2)
+                        time.sleep(5)
                     else:
-                        print(f"  [{SERVER_ID}] Failed to write to {tab_name}: {e}")
-            time.sleep(0.5)
+                        print(f"  [{SERVER_ID}] Failed to write batch to {tab_name}: {e}")
+                        counts[tab_name] = 0
+            time.sleep(1)
 
         status_col = status_col_idx + 1
-        for idx in ready_row_indices:
-            try:
-                source_ws.update_cell(idx, status_col, "distributed")
-            except:
-                pass
-            time.sleep(0.3)
+        dist_cells = [gspread.Cell(row=idx, col=status_col, value="distributed") for idx in ready_row_indices]
+        if dist_cells:
+            for i in range(0, len(dist_cells), 500):
+                source_ws.update_cells(dist_cells[i:i+500])
+                time.sleep(1)
 
         total = sum(counts.values())
         send_telegram(f"Distributed {total} prompts: {counts}")
@@ -1578,15 +1584,16 @@ def mark_ready():
         status_col = headers.index("status") + 1
         prompt_idx = headers.index("prompt")
 
-        marked = 0
+        cells_to_update = []
         for idx, row in enumerate(all_rows[1:], start=2):
             prompt_val = row[prompt_idx].strip() if prompt_idx < len(row) else ""
             status_val = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
-            if prompt_val and status_val in ("", "ready"):
-                if status_val != "ready":
-                    ws.update_cell(idx, status_col, "READY")
-                    marked += 1
-                    time.sleep(0.3)
+            if prompt_val and status_val not in ("ready", "done", "processing", "error"):
+                cells_to_update.append(gspread.Cell(row=idx, col=status_col, value="READY"))
+
+        marked = len(cells_to_update)
+        if cells_to_update:
+            ws.update_cells(cells_to_update)
 
         send_telegram(f"Marked {marked} prompts as READY in USA tab")
         return {"status": "ok", "server_id": SERVER_ID, "marked": marked}
@@ -1624,17 +1631,18 @@ def retry_errors():
                 continue
 
             status_col = headers.index("status") + 1
-            retried = 0
+            cells_to_update = []
 
             for idx, row in enumerate(all_rows[1:], start=2):
                 st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
                 if st == "error":
-                    ws.update_cell(idx, status_col, "READY")
-                    retried += 1
-                    time.sleep(0.3)
+                    cells_to_update.append(gspread.Cell(row=idx, col=status_col, value="READY"))
 
-            per_tab[tab_name] = retried
-            total_retried += retried
+            if cells_to_update:
+                ws.update_cells(cells_to_update)
+
+            per_tab[tab_name] = len(cells_to_update)
+            total_retried += len(cells_to_update)
 
         send_telegram(f"Retried {total_retried} error prompts: {per_tab}")
         return {"status": "ok", "server_id": SERVER_ID, "retried": total_retried, "per_tab": per_tab}

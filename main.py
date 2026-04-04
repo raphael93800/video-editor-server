@@ -918,7 +918,7 @@ def full_pipeline(country="USA"):
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
-            for p_data in prompts:
+            for i, p_data in enumerate(prompts):
                 current_vid = vid_index
                 vid_index += 1
                 future = executor.submit(
@@ -928,6 +928,8 @@ def full_pipeline(country="USA"):
                     local_part2_clean, edited_names
                 )
                 futures[future] = current_vid
+                if i < len(prompts) - 1:
+                    time.sleep(15)
 
             for future in as_completed(futures):
                 v = futures[future]

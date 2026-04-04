@@ -652,14 +652,14 @@ def get_prompts_for_country(gc, country_cfg, limit=5):
 
     return prompts
 
-def _sheets_retry(func, max_retries=4):
+def _sheets_retry(func, max_retries=6):
     """Retry a Sheets API call with exponential backoff on 429 errors."""
     for attempt in range(max_retries):
         try:
             return func()
         except gspread.exceptions.APIError as e:
             if "429" in str(e) and attempt < max_retries - 1:
-                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                wait = (2 ** attempt) * 3 + random.uniform(1, 5)
                 print(f"  [{SERVER_ID}] Sheets 429, retry {attempt+1} in {wait:.0f}s")
                 time.sleep(wait)
             else:
@@ -792,23 +792,23 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         version = ((vid_index - 1) // VIDEOS_PER_CAMPAIGN) + 1
         drive_link, direct_link = make_drive_links(out_id)
 
-        for attempt in range(3):
-            try:
-                _, gc_t = get_google_services()
-                mws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
-                mws.append_row(
-                    [nom_final.replace(".mp4", ""), drive_link, direct_link,
+        master_row = [nom_final.replace(".mp4", ""), drive_link, direct_link,
                      f"C{date_str}_{SERVER_ID}_{country}_{version:02d}",
                      f"adset{version}_{SERVER_ID}_{country}_{date_str}",
                      p_data["primary_text"], p_data["headline_meta"], prompt_text,
-                     "pending", "video", ""],
-                    value_input_option="USER_ENTERED"
-                )
+                     "pending", "video", ""]
+        for attempt in range(5):
+            try:
+                with sheet_lock:
+                    _, gc_t = get_google_services()
+                    mws = get_or_create_master_tab(gc_t, c_cfg["master_tab"])
+                    mws.append_row(master_row, value_input_option="USER_ENTERED")
                 break
             except Exception as se:
-                print(f"  [{SERVER_ID}] Sheet write retry {attempt+1}: {se}")
-                if attempt < 2:
-                    time.sleep(5)
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                print(f"  [{SERVER_ID}] Sheet write retry {attempt+1}: {se} (wait {wait:.0f}s)")
+                if attempt < 4:
+                    time.sleep(wait)
                 else:
                     send_telegram(f"{country} Sheet write FAILED V{vid_index}: {str(se)[:100]}")
 

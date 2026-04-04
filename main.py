@@ -727,8 +727,9 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         return "skipped"
 
     try:
+        local_drive, _ = get_google_services()
         dup_q = f"'{edited_folder_id}' in parents and trashed=false and name='{nom_final}'"
-        dup_check = drive_svc.files().list(
+        dup_check = local_drive.files().list(
             q=dup_q, fields="files(id)", supportsAllDrives=True,
             includeItemsFromAllDrives=True, pageSize=1
         ).execute().get("files", [])
@@ -737,7 +738,7 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
             edited_names.add(nom_final)
             return "skipped"
     except Exception as dup_err:
-        print(f"  [{SERVER_ID}/{country}] Drive dup check error: {dup_err}")
+        print(f"  [{SERVER_ID}/{country}] Drive dup check warn (continuing): {dup_err}")
 
     local_raw = f"/tmp/gen_{SERVER_ID}_{uid}.mp4"
     local_edited = None
@@ -763,8 +764,10 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
 
         kie_download_video(video_url, local_raw)
 
+        thread_drive, _ = get_google_services()
+
         orig_name = f"veo_{SERVER_ID}_{datetime.datetime.now().strftime('%H%M%S')}_{uid}.mp4"
-        drive_upload_video(drive_svc, local_raw, original_folder_id, orig_name)
+        drive_upload_video(thread_drive, local_raw, original_folder_id, orig_name)
         print(f"  [{SERVER_ID}/{country}] V{vid_index}: original uploaded")
 
         edit_semaphore.acquire()
@@ -782,7 +785,7 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         if not local_edited or not os.path.exists(local_edited) or os.path.getsize(local_edited) < 10000:
             raise Exception("Edited file missing or too small")
 
-        out_id = drive_upload_video(drive_svc, local_edited, edited_folder_id, nom_final)
+        out_id = drive_upload_video(thread_drive, local_edited, edited_folder_id, nom_final)
         edited_names.add(nom_final)
         print(f"  [{SERVER_ID}/{country}] V{vid_index}: edited uploaded")
 
@@ -1565,7 +1568,6 @@ def distribute_prompts():
                 ws = ss.worksheet(tab_name)
             except gspread.exceptions.WorksheetNotFound:
                 ws = ss.add_worksheet(title=tab_name, rows=1000, cols=20)
-                ws.append_row(all_rows[0], value_input_option="USER_ENTERED")
                 print(f"  [{SERVER_ID}] Created tab {tab_name}")
             target_worksheets.append(ws)
 
@@ -1587,7 +1589,9 @@ def distribute_prompts():
             ws = target_worksheets[tab_idx]
             for attempt in range(3):
                 try:
-                    ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+                    ws.clear()
+                    all_data = [all_rows[0]] + rows_to_add
+                    ws.update(f"A1:{chr(64+len(all_rows[0]))}{len(all_data)}", all_data, value_input_option="USER_ENTERED")
                     counts[tab_name] = len(rows_to_add)
                     break
                 except Exception as e:

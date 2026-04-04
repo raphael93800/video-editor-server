@@ -1480,6 +1480,108 @@ def dedup_master(country: str = "USA"):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/rebuild-master")
+def rebuild_master(country: str = "USA"):
+    """Fill missing Primary_Text, Headline, Video_Prompt from all prompt tabs (USA + USA_1..5)."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        _, gc = get_google_services()
+        ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
+
+        all_tabs = [c_cfg["prompt_tab"]] + DISTRIBUTE_TABS
+        prompt_lookup = {}
+        for tab_name in all_tabs:
+            try:
+                ws = _sheets_retry(lambda t=tab_name: ss.worksheet(t))
+                rows = _sheets_retry(lambda: ws.get_all_values())
+                if len(rows) <= 1:
+                    continue
+                headers = [h.strip().lower() for h in rows[0]]
+                for row in rows[1:]:
+                    rd = {headers[j]: row[j].strip() for j in range(min(len(headers), len(row)))}
+                    prompt_text = rd.get("prompt", "")
+                    if not prompt_text:
+                        continue
+                    if prompt_text not in prompt_lookup:
+                        prompt_lookup[prompt_text] = {
+                            "primary_text": rd.get("primary text", ""),
+                            "headline": rd.get("headline meta", ""),
+                        }
+            except gspread.exceptions.WorksheetNotFound:
+                continue
+            except Exception as e:
+                print(f"[rebuild-master] Error reading {tab_name}: {e}")
+
+        print(f"[rebuild-master] Loaded {len(prompt_lookup)} unique prompts from {len(all_tabs)} tabs")
+
+        mws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        all_rows = _sheets_retry(lambda: mws.get_all_values())
+        if len(all_rows) <= 1:
+            return {"status": "ok", "fixed": 0, "total": 0}
+
+        header = all_rows[0]
+        h_lower = [h.strip().lower() for h in header]
+        pt_col = h_lower.index("primary_text") if "primary_text" in h_lower else 5
+        hl_col = h_lower.index("headline") if "headline" in h_lower else 6
+        vp_col = h_lower.index("video_prompt") if "video_prompt" in h_lower else 7
+
+        cells_to_update = []
+        fixed = 0
+        for row_idx, row in enumerate(all_rows[1:], start=2):
+            while len(row) <= max(pt_col, hl_col, vp_col):
+                row.append("")
+
+            current_pt = row[pt_col].strip()
+            current_hl = row[hl_col].strip()
+            current_vp = row[vp_col].strip()
+
+            if current_pt and current_hl and current_vp:
+                continue
+
+            match_prompt = current_vp if current_vp in prompt_lookup else ""
+            if not match_prompt:
+                for col_val in row:
+                    v = col_val.strip()
+                    if len(v) > 50 and v in prompt_lookup:
+                        match_prompt = v
+                        break
+
+            if not match_prompt and len(prompt_lookup) == 1:
+                match_prompt = list(prompt_lookup.keys())[0]
+
+            if not match_prompt or match_prompt not in prompt_lookup:
+                continue
+
+            p_info = prompt_lookup[match_prompt]
+            row_fixed = False
+
+            if not current_pt and p_info.get("primary_text"):
+                cells_to_update.append(gspread.Cell(row_idx, pt_col + 1, p_info["primary_text"]))
+                row_fixed = True
+            if not current_hl and p_info.get("headline"):
+                cells_to_update.append(gspread.Cell(row_idx, hl_col + 1, p_info["headline"]))
+                row_fixed = True
+            if not current_vp and match_prompt:
+                cells_to_update.append(gspread.Cell(row_idx, vp_col + 1, match_prompt))
+                row_fixed = True
+            if row_fixed:
+                fixed += 1
+
+        if cells_to_update:
+            _sheets_retry(lambda: mws.update_cells(cells_to_update, value_input_option="USER_ENTERED"))
+
+        msg = f"[{c}] rebuild-master: fixed {fixed}/{len(all_rows)-1} rows ({len(cells_to_update)} cells)"
+        print(msg)
+        send_telegram(msg)
+        return {"status": "ok", "server_id": SERVER_ID, "fixed": fixed, "cells_updated": len(cells_to_update), "total": len(all_rows)-1}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/check-sheet")
 def check_sheet(country: str = "USA"):
     c = country.upper()

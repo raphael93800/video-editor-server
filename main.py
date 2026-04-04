@@ -192,14 +192,26 @@ def make_drive_links(file_id):
 # ============================================================
 # MASTER SHEET
 # ============================================================
+_master_ss_cache = {}
+_master_ss_lock = threading.Lock()
+
 def get_or_create_master_tab(gc, tab_name):
-    spreadsheet = gc.open_by_url(MASTER_SHEET_URL)
+    with _master_ss_lock:
+        ss = _master_ss_cache.get("_ss")
+        if ss is None:
+            ss = _sheets_retry(lambda: gc.open_by_url(MASTER_SHEET_URL))
+            _master_ss_cache["_ss"] = ss
+        ws = _master_ss_cache.get(tab_name)
+        if ws is not None:
+            return ws
     try:
-        ws = spreadsheet.worksheet(tab_name)
+        ws = _sheets_retry(lambda: ss.worksheet(tab_name))
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=tab_name, rows=1000, cols=20)
+        ws = ss.add_worksheet(title=tab_name, rows=1000, cols=20)
         ws.append_row(MASTER_SHEET_HEADERS, value_input_option="USER_ENTERED")
         print(f"  [{SERVER_ID}] Tab '{tab_name}' created in Master Sheet")
+    with _master_ss_lock:
+        _master_ss_cache[tab_name] = ws
     return ws
 
 # ============================================================
@@ -669,28 +681,30 @@ def _get_worksheet(gc, tab_name):
             _ws_cache[tab_name] = ws
         return ws
 
-def mark_prompt_status(gc, country_cfg, row_index, status, prompt_text=None):
-    prompt_tab = country_cfg["prompt_tab"]
+_headers_cache = {}
+_headers_cache_lock = threading.Lock()
+
+def _get_status_col(gc, prompt_tab):
+    """Get status column index (1-based), cached per tab."""
+    with _headers_cache_lock:
+        if prompt_tab in _headers_cache:
+            return _headers_cache[prompt_tab]
     ws = _get_worksheet(gc, prompt_tab)
     headers = [h.strip().lower() for h in _sheets_retry(lambda: ws.row_values(1))]
-    if "status" not in headers:
-        return
-    status_col = headers.index("status") + 1
+    status_col = (headers.index("status") + 1) if "status" in headers else -1
+    with _headers_cache_lock:
+        _headers_cache[prompt_tab] = status_col
+    return status_col
 
-    if prompt_text and "prompt" in headers:
-        prompt_col = headers.index("prompt")
-        all_rows = _sheets_retry(lambda: ws.get_all_values())
-        found = False
-        for idx, row in enumerate(all_rows[1:], start=2):
-            cell_prompt = row[prompt_col].strip() if prompt_col < len(row) else ""
-            if cell_prompt == prompt_text.strip():
-                _sheets_retry(lambda: ws.update_cell(idx, status_col, status))
-                found = True
-                break
-        if not found:
-            print(f"  [{SERVER_ID}] mark_prompt_status: prompt not found, skipping")
-    else:
-        _sheets_retry(lambda: ws.update_cell(row_index, status_col, status))
+def mark_prompt_status(gc, country_cfg, row_index, status, prompt_text=None):
+    prompt_tab = country_cfg["prompt_tab"]
+    status_col = _get_status_col(gc, prompt_tab)
+    if status_col < 0:
+        return
+    ws = _get_worksheet(gc, prompt_tab)
+    s = status
+    r = row_index
+    _sheets_retry(lambda: ws.update_cell(r, status_col, s))
 
 # ============================================================
 # FULL PIPELINE: PARALLEL generation -> edit -> upload -> log
@@ -732,21 +746,14 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         with sheet_lock:
             _, gc_s = get_google_services()
             ws_check = _get_worksheet(gc_s, c_cfg["prompt_tab"])
-            all_current = _sheets_retry(lambda: ws_check.get_all_values())
-            h_check = [h.strip().lower() for h in all_current[0]] if all_current else []
-            prompt_col = h_check.index("prompt") if "prompt" in h_check else -1
-            status_col_idx = h_check.index("status") if "status" in h_check else -1
-            still_ready = False
-            for cr in all_current[1:]:
-                cp = cr[prompt_col].strip() if prompt_col >= 0 and prompt_col < len(cr) else ""
-                cs = cr[status_col_idx].strip().lower() if status_col_idx >= 0 and status_col_idx < len(cr) else ""
-                if cp == prompt_text.strip() and cs == "ready":
-                    still_ready = True
-                    break
-            if not still_ready:
-                print(f"  [{SERVER_ID}/{country}] V{vid_index}: prompt no longer READY, skipping")
-                return "skipped"
-            mark_prompt_status(gc_s, c_cfg, row_index, "processing", prompt_text=prompt_text)
+            status_col = _get_status_col(gc_s, c_cfg["prompt_tab"])
+            if status_col > 0:
+                ri = row_index
+                cell_val = _sheets_retry(lambda: ws_check.cell(ri, status_col).value)
+                if cell_val and cell_val.strip().lower() != "ready":
+                    print(f"  [{SERVER_ID}/{country}] V{vid_index}: prompt no longer READY ({cell_val}), skipping")
+                    return "skipped"
+            mark_prompt_status(gc_s, c_cfg, row_index, "processing")
 
         print(f"  [{SERVER_ID}/{country}] V{vid_index}: generating...")
 
@@ -805,7 +812,7 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         with sheet_lock:
             try:
                 _, gc_d = get_google_services()
-                mark_prompt_status(gc_d, c_cfg, row_index, "done", prompt_text=prompt_text)
+                mark_prompt_status(gc_d, c_cfg, row_index, "done")
             except Exception as mark_err:
                 print(f"  [{SERVER_ID}/{country}] V{vid_index} mark done failed: {mark_err}")
 
@@ -820,7 +827,7 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
         try:
             with sheet_lock:
                 _, gc_e = get_google_services()
-                mark_prompt_status(gc_e, c_cfg, row_index, "error", prompt_text=prompt_text)
+                mark_prompt_status(gc_e, c_cfg, row_index, "error")
         except:
             pass
         return "error"
@@ -1046,20 +1053,22 @@ def recover_stuck_processing():
     try:
         _, gc = get_google_services()
         for c_name, c_cfg in COUNTRY_CONFIG.items():
-            ss = gc.open_by_key(PROMPTS_SHEET_ID)
-            ws = ss.worksheet(c_cfg["prompt_tab"])
-            all_rows = ws.get_all_values()
+            ws = _get_worksheet(gc, c_cfg["prompt_tab"])
+            all_rows = _sheets_retry(lambda: ws.get_all_values())
             if not all_rows:
                 continue
             headers = [h.strip().lower() for h in all_rows[0]]
             if "status" not in headers:
                 continue
             status_col = headers.index("status") + 1
+            cells_to_update = []
             for idx, row in enumerate(all_rows[1:], start=2):
                 st = row[status_col - 1].strip().lower() if status_col - 1 < len(row) else ""
                 if st == "processing":
-                    ws.update_cell(idx, status_col, "READY")
-                    reverted += 1
+                    cells_to_update.append(gspread.Cell(row=idx, col=status_col, value="READY"))
+            if cells_to_update:
+                _sheets_retry(lambda: ws.update_cells(cells_to_update))
+                reverted += len(cells_to_update)
         if reverted > 0:
             print(f"[{SERVER_ID}] Recovery: reverted {reverted} stuck processing prompts")
             send_telegram(f"Recovery: reverted {reverted} stuck processing prompts")
@@ -1070,7 +1079,7 @@ def recover_stuck_processing():
 # ============================================================
 # CRON
 # ============================================================
-CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "30"))
+CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "60"))
 cron_enabled = os.environ.get("CRON_ENABLED", "true").lower() == "true"
 
 def has_ready_prompts():

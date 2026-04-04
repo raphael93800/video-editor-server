@@ -315,22 +315,24 @@ class ControlPanel(tk.Tk):
         self.after(REFRESH_INTERVAL_MS, self._schedule_refresh)
 
     def _refresh_all(self):
+        results = {}
         for srv in SERVERS:
             try:
                 data = api_call(srv["url"], "/status", timeout=5)
             except Exception:
                 data = {"_error": "timeout"}
-            self._server_data[srv["id"]] = data
-            sid = srv["id"]
-            self.after(0, lambda s=sid, d=data: self._update_card(s, d))
+            results[srv["id"]] = data
 
-        self.after(100, self._update_global)
+        self._server_data = results
+        self.after(0, lambda r=results: self._apply_refresh(r))
 
-    def _update_card(self, sid, data):
-        try:
-            self.cards[sid].update_status(data)
-        except Exception as e:
-            _dbg(f"UI update error {sid}: {e}")
+    def _apply_refresh(self, results):
+        for sid, data in results.items():
+            try:
+                self.cards[sid].update_status(data)
+            except Exception as e:
+                _dbg(f"UI update error {sid}: {e}")
+        self._update_global()
 
     def _update_global(self):
         td = 0

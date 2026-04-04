@@ -32,6 +32,8 @@ DEFAULT_TITLE       = os.environ.get("DEFAULT_TITLE",       "The danger no one t
 VIDEOS_PER_CAMPAIGN = int(os.environ.get("VIDEOS_PER_CAMPAIGN", "20"))
 TELEGRAM_TOKEN      = os.environ.get("TELEGRAM_TOKEN",      "8747966519:AAEsz9JSa8OXcETu9OnUWwf6v1LdvNxrv3w")
 TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID",    "1687730801")
+TELEGRAM_TOKEN_2    = os.environ.get("TELEGRAM_TOKEN_2",    "8783615990:AAGKLDgoO4xqaWOB-sjURHLzbG2Db_PMIPM")
+TELEGRAM_CHAT_ID_2  = os.environ.get("TELEGRAM_CHAT_ID_2",  "6565965496")
 GOOGLE_CREDS_JSON   = os.environ.get("GOOGLE_CREDS_JSON",   "")
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "")
 
@@ -218,16 +220,20 @@ def get_or_create_master_tab(gc, tab_name):
 # TELEGRAM
 # ============================================================
 def send_telegram(msg):
-    try:
-        resp = http_requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"[{SERVER_ID}] {msg}"},
-            timeout=10
-        )
-        if not resp.ok:
-            print(f"  [{SERVER_ID}] Telegram error: {resp.status_code} — {resp.text[:200]}")
-    except Exception as e:
-        print(f"  [{SERVER_ID}] Telegram send failed: {e}")
+    text = f"[{SERVER_ID}] {msg}"
+    for token, chat_id in [(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID), (TELEGRAM_TOKEN_2, TELEGRAM_CHAT_ID_2)]:
+        if not token or not chat_id:
+            continue
+        try:
+            resp = http_requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10
+            )
+            if not resp.ok:
+                print(f"  [{SERVER_ID}] Telegram error: {resp.status_code} — {resp.text[:200]}")
+        except Exception as e:
+            print(f"  [{SERVER_ID}] Telegram send failed: {e}")
 
 # ============================================================
 # FFMPEG HELPERS

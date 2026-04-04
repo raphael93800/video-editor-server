@@ -1501,7 +1501,7 @@ def dedup_master(country: str = "USA"):
 
 @app.post("/clean-drive")
 def clean_drive(country: str = "USA", date: str = None):
-    """Remove duplicate video files from the Drive 'edited' folder, keeping only one per base name."""
+    """Remove orphan video files from Drive that are NOT referenced in the Master Sheet."""
     c = country.upper()
     if c not in COUNTRY_CONFIG:
         return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
@@ -1510,9 +1510,23 @@ def clean_drive(country: str = "USA", date: str = None):
         date = datetime.datetime.now().strftime("%d.%m")
 
     try:
-        drive_svc, _ = get_google_services()
-        results_folder_id = c_cfg["results_folder_id"]
+        drive_svc, gc = get_google_services()
 
+        mws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        all_rows = _sheets_retry(lambda: mws.get_all_values())
+        master_names = set()
+        master_file_ids = set()
+        if len(all_rows) > 1:
+            for row in all_rows[1:]:
+                ad_name = row[0].strip() if row else ""
+                if ad_name:
+                    master_names.add(ad_name + ".mp4")
+                if len(row) > 1 and "drive.google.com" in row[1]:
+                    m = re.search(r"/d/([^/]+)/", row[1])
+                    if m:
+                        master_file_ids.add(m.group(1))
+
+        results_folder_id = c_cfg["results_folder_id"]
         q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date}'"
         date_folders = drive_svc.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
         if not date_folders:
@@ -1522,42 +1536,39 @@ def clean_drive(country: str = "USA", date: str = None):
         sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
         subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
 
-        total_deleted = 0
-        total_kept = 0
-        folder_details = {}
+        edit_folder_id = next((f["id"] for f in subs if f["name"] == "edited"), None)
+        if not edit_folder_id:
+            return {"status": "error", "message": "No 'edited' folder found"}
 
-        for folder_name in ["edited", "original"]:
-            folder_id = next((f["id"] for f in subs if f["name"] == folder_name), None)
-            if not folder_id:
-                continue
+        all_files = drive_list_all_files(drive_svc, edit_folder_id)
 
-            all_files = drive_list_all_files(drive_svc, folder_id)
-            seen = {}
-            duplicates = []
+        seen_names = {}
+        to_delete = []
+        for f in sorted(all_files, key=lambda x: x["name"]):
+            name = f["name"]
+            fid = f["id"]
+            if name in seen_names:
+                to_delete.append({"id": fid, "name": name, "reason": "duplicate_name"})
+            elif name not in master_names and fid not in master_file_ids:
+                to_delete.append({"id": fid, "name": name, "reason": "orphan"})
+            else:
+                seen_names[name] = fid
 
-            for f in sorted(all_files, key=lambda x: x["name"]):
-                name = f["name"]
-                if name in seen:
-                    duplicates.append(f["id"])
-                else:
-                    seen[name] = f["id"]
+        deleted = 0
+        for f in to_delete:
+            try:
+                drive_svc.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+                deleted += 1
+            except Exception as e:
+                print(f"  [{SERVER_ID}] Failed to delete {f['name']}: {e}")
 
-            for fid in duplicates:
-                try:
-                    drive_svc.files().delete(fileId=fid, supportsAllDrives=True).execute()
-                except Exception as e:
-                    print(f"  [{SERVER_ID}] Failed to delete {fid}: {e}")
-
-            total_deleted += len(duplicates)
-            total_kept += len(seen)
-            folder_details[folder_name] = {"kept": len(seen), "deleted": len(duplicates)}
-
-        msg = f"[{c}] clean-drive {date}: kept {total_kept}, deleted {total_deleted} duplicates"
+        kept = len(seen_names)
+        msg = f"[{c}] clean-drive {date}: kept {kept} edited, deleted {deleted} (orphans+dupes)"
         print(msg)
         send_telegram(msg)
         return {"status": "ok", "server_id": SERVER_ID, "date": date,
-                "total_kept": total_kept, "total_deleted": total_deleted,
-                "folders": folder_details}
+                "edited_kept": kept, "edited_deleted": deleted,
+                "master_sheet_rows": len(all_rows) - 1}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}

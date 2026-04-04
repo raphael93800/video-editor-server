@@ -71,6 +71,17 @@ FONT_PATH = "/usr/share/fonts/truetype/custom/Montserrat-Bold.ttf"
 is_processing = False
 last_activity_time = time.time()
 WATCHDOG_TIMEOUT = 7200
+AUTO_RECOVERY_INTERVAL = 300
+PROGRESS_REPORT_INTERVAL = 600
+
+ALL_SERVER_URLS = {
+    "S1": "https://video-editor-server.onrender.com",
+    "S2": "https://video-editor-server-2.onrender.com",
+    "S3": "https://video-editor-server-3.onrender.com",
+    "S4": "https://video-editor-server-4.onrender.com",
+    "S5": "https://video-editor-server-1.onrender.com",
+}
+TELEGRAM_BOT_ENABLED = os.environ.get("TELEGRAM_BOT_ENABLED", "false").lower() == "true"
 
 # ============================================================
 # GOOGLE AUTH (cached credentials)
@@ -1144,6 +1155,265 @@ def cron_loop():
             print(f"[{SERVER_ID}] Cron error: {e}")
             traceback.print_exc()
 
+def auto_recovery_loop():
+    """Watchdog that auto-recovers stuck batches and sends progress reports."""
+    global is_processing, last_activity_time
+    last_progress_report = time.time()
+    print(f"[{SERVER_ID}] Auto-recovery watchdog started (every {AUTO_RECOVERY_INTERVAL}s)")
+
+    while True:
+        time.sleep(AUTO_RECOVERY_INTERVAL)
+        try:
+            stale = time.time() - last_activity_time
+            if is_processing and stale > WATCHDOG_TIMEOUT:
+                print(f"[{SERVER_ID}] WATCHDOG: stuck for {stale:.0f}s, forcing reset!")
+                send_telegram(f"⚠️ WATCHDOG: processing stuck for {stale:.0f}s, forcing reset")
+                is_processing = False
+
+            if not is_processing:
+                counts = _refresh_prompt_counts()
+                has_ready = counts.get("ready", 0) > 0
+                has_stuck = counts.get("processing", 0) > 0
+
+                if has_stuck:
+                    reverted = recover_stuck_processing()
+                    if reverted > 0:
+                        send_telegram(f"🔄 Auto-recovery: reset {reverted} stuck prompts to READY")
+
+                counts = _refresh_prompt_counts()
+                has_ready = counts.get("ready", 0) > 0
+
+                if has_ready:
+                    print(f"[{SERVER_ID}] Auto-recovery: found {counts['ready']} READY prompts, relaunching...")
+                    send_telegram(f"🔄 Auto-recovery: relaunching {counts['ready']} READY prompts")
+                    is_processing = True
+                    last_activity_time = time.time()
+                    threading.Thread(target=full_pipeline, args=("USA",), daemon=True).start()
+
+            now = time.time()
+            if now - last_progress_report >= PROGRESS_REPORT_INTERVAL:
+                last_progress_report = now
+                counts = _refresh_prompt_counts()
+                total = counts.get("total", 0)
+                done = counts.get("done", 0)
+                error = counts.get("error", 0)
+                ready = counts.get("ready", 0)
+                processing = counts.get("processing", 0)
+                if total > 0:
+                    pct = round(done / total * 100)
+                    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                    send_telegram(
+                        f"📊 Progress: {bar} {pct}%\n"
+                        f"✅ Done: {done}/{total}\n"
+                        f"⏳ Processing: {processing}\n"
+                        f"📋 Ready: {ready}\n"
+                        f"❌ Errors: {error}"
+                    )
+
+        except Exception as e:
+            print(f"[{SERVER_ID}] Auto-recovery error: {e}")
+            traceback.print_exc()
+
+
+def _get_all_servers_status():
+    """Fetch status from all servers in parallel."""
+    results = {}
+    def fetch_one(sid, url):
+        try:
+            resp = http_requests.get(f"{url}/status", timeout=10)
+            if resp.ok:
+                results[sid] = resp.json()
+            else:
+                results[sid] = {"error": f"HTTP {resp.status_code}"}
+        except Exception:
+            results[sid] = {"error": "offline"}
+
+    threads = []
+    for sid, url in ALL_SERVER_URLS.items():
+        t = threading.Thread(target=fetch_one, args=(sid, url))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=15)
+    return results
+
+
+def telegram_bot_loop():
+    """Long-polling Telegram bot for remote commands."""
+    token = TELEGRAM_TOKEN_2
+    allowed_chats = {TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_2}
+    offset = 0
+    print(f"[{SERVER_ID}] Telegram bot started (polling)")
+
+    while True:
+        try:
+            resp = http_requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=35
+            )
+            if not resp.ok:
+                time.sleep(5)
+                continue
+
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip().lower()
+
+                if chat_id not in allowed_chats:
+                    continue
+
+                reply = _handle_telegram_command(text)
+                if reply:
+                    http_requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"},
+                        timeout=10
+                    )
+
+        except Exception as e:
+            print(f"[{SERVER_ID}] Telegram bot error: {e}")
+            time.sleep(5)
+
+
+def _handle_telegram_command(text):
+    """Handle a Telegram command and return the reply text."""
+
+    if text in ("/status", "/s"):
+        statuses = _get_all_servers_status()
+        lines = ["📡 *Server Status*\n"]
+        for sid in sorted(statuses.keys()):
+            data = statuses[sid]
+            if "error" in data:
+                lines.append(f"  {sid}: ❌ {data['error']}")
+            else:
+                p = data.get("prompts", {})
+                status_icon = "🔄" if data.get("processing") else "💤"
+                lines.append(f"  {sid}: {status_icon} Done:{p.get('done',0)} Proc:{p.get('processing',0)} Ready:{p.get('ready',0)} Err:{p.get('error',0)}")
+        return "\n".join(lines)
+
+    elif text in ("/remaining", "/r"):
+        statuses = _get_all_servers_status()
+        lines = ["📋 *Remaining by server*\n"]
+        total_remaining = 0
+        total_all = 0
+        for sid in sorted(statuses.keys()):
+            data = statuses[sid]
+            if "error" in data:
+                lines.append(f"  {sid}: ❌ offline")
+            else:
+                p = data.get("prompts", {})
+                remaining = p.get("ready", 0) + p.get("processing", 0)
+                total = p.get("total", 0)
+                done = p.get("done", 0)
+                total_remaining += remaining
+                total_all += total
+                lines.append(f"  {sid}: {remaining} restants ({done}/{total} done)")
+        lines.append(f"\n*Total: {total_remaining} restants / {total_all}*")
+        return "\n".join(lines)
+
+    elif text in ("/progress", "/p"):
+        statuses = _get_all_servers_status()
+        total_done = 0
+        total_error = 0
+        total_ready = 0
+        total_processing = 0
+        total_all = 0
+        for data in statuses.values():
+            if "error" not in data:
+                p = data.get("prompts", {})
+                total_done += p.get("done", 0)
+                total_error += p.get("error", 0)
+                total_ready += p.get("ready", 0)
+                total_processing += p.get("processing", 0)
+                total_all += p.get("total", 0)
+        if total_all > 0:
+            pct = round(total_done / total_all * 100)
+            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+            eta_remaining = total_ready + total_processing
+            eta_min = round(eta_remaining * 3 / 50)
+            return (
+                f"📊 *Progress*\n\n"
+                f"{bar} {pct}%\n\n"
+                f"✅ Done: {total_done}/{total_all}\n"
+                f"⏳ Processing: {total_processing}\n"
+                f"📋 Ready: {total_ready}\n"
+                f"❌ Errors: {total_error}\n"
+                f"⏱ ETA: ~{eta_min} min"
+            )
+        return "No data available"
+
+    elif text in ("/launch", "/l"):
+        results = []
+        for sid, url in ALL_SERVER_URLS.items():
+            try:
+                resp = http_requests.post(f"{url}/process?country=USA", timeout=15)
+                data = resp.json()
+                results.append(f"  {sid}: {data.get('status', 'unknown')}")
+            except Exception as e:
+                results.append(f"  {sid}: ❌ {str(e)[:50]}")
+        return "🚀 *Launch all servers*\n\n" + "\n".join(results)
+
+    elif text in ("/reset",):
+        results = []
+        for sid, url in ALL_SERVER_URLS.items():
+            try:
+                resp = http_requests.post(f"{url}/reset", timeout=15)
+                data = resp.json()
+                rev = data.get("reverted_to_ready", 0)
+                results.append(f"  {sid}: reset {rev} stuck")
+            except Exception as e:
+                results.append(f"  {sid}: ❌ {str(e)[:50]}")
+        return "🔄 *Reset all servers*\n\n" + "\n".join(results)
+
+    elif text in ("/retry",):
+        results = []
+        for sid, url in ALL_SERVER_URLS.items():
+            try:
+                resp = http_requests.post(f"{url}/retry-errors?country=USA", timeout=15)
+                data = resp.json()
+                retried = data.get("retried", 0)
+                results.append(f"  {sid}: retried {retried}")
+            except Exception as e:
+                results.append(f"  {sid}: ❌ {str(e)[:50]}")
+        return "🔁 *Retry errors*\n\n" + "\n".join(results)
+
+    elif text in ("/errors", "/e"):
+        statuses = _get_all_servers_status()
+        total_errors = 0
+        lines = ["❌ *Errors by server*\n"]
+        for sid in sorted(statuses.keys()):
+            data = statuses[sid]
+            if "error" not in data:
+                errs = data.get("prompts", {}).get("error", 0)
+                total_errors += errs
+                if errs > 0:
+                    lines.append(f"  {sid}: {errs} errors")
+        if total_errors == 0:
+            lines.append("  ✅ No errors!")
+        else:
+            lines.append(f"\n*Total: {total_errors} errors*")
+        return "\n".join(lines)
+
+    elif text in ("/help", "/h"):
+        return (
+            "🤖 *Available Commands*\n\n"
+            "/status (or /s) — Status de chaque serveur\n"
+            "/remaining (or /r) — Nombre restant par serveur\n"
+            "/progress (or /p) — Progression globale + ETA\n"
+            "/launch (or /l) — Lancer tous les serveurs\n"
+            "/reset — Reset stuck + relance\n"
+            "/retry — Retry les erreurs\n"
+            "/errors (or /e) — Liste des erreurs\n"
+            "/help (or /h) — Cette aide"
+        )
+
+    return None
+
+
 @app.on_event("startup")
 def start_cron():
     print(f"[{SERVER_ID}] Server starting up...")
@@ -1157,12 +1427,22 @@ def start_cron():
         if cron_enabled:
             cron_loop()
 
+    # Always start auto-recovery watchdog
+    t_recovery = threading.Thread(target=auto_recovery_loop, daemon=True)
+    t_recovery.start()
+    print(f"[{SERVER_ID}] Auto-recovery watchdog started")
+
     if cron_enabled:
         t = threading.Thread(target=delayed_startup, daemon=True)
         t.start()
         print(f"[{SERVER_ID}] Cron thread will start in 30s (every {CRON_INTERVAL}s)")
     else:
         print(f"[{SERVER_ID}] Cron disabled")
+
+    if TELEGRAM_BOT_ENABLED:
+        t_bot = threading.Thread(target=telegram_bot_loop, daemon=True)
+        t_bot.start()
+        print(f"[{SERVER_ID}] Telegram bot started")
 
 # ============================================================
 # ENDPOINTS

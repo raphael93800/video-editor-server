@@ -926,10 +926,9 @@ def full_pipeline(country="USA"):
 
         send_telegram(f"{country} Pipeline done: {total_success} OK, {total_errors} errors out of {len(prompts)}")
 
-        try:
-            reconcile_master_sheet(country)
-        except Exception as rec_err:
-            print(f"[{SERVER_ID}/{country}] Reconciliation failed: {rec_err}")
+        # reconcile_master_sheet disabled: each video is already written
+        # individually in _process_single_prompt; running reconcile caused
+        # duplicate rows because every server re-scans the shared Drive folder.
 
     except Exception as e:
         print(f"[{SERVER_ID}/{country}] Pipeline critical error: {e}")
@@ -1426,6 +1425,56 @@ def clean_sheet(country: str = "USA", keep_date: str = None):
         send_telegram(msg)
         return {"status": "ok", "server_id": SERVER_ID, "kept": kept, "removed": removed}
 
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/dedup-master")
+def dedup_master(country: str = "USA"):
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    c_cfg = COUNTRY_CONFIG[c]
+    try:
+        _, gc = get_google_services()
+        ws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        all_rows = _sheets_retry(lambda: ws.get_all_values())
+        if len(all_rows) <= 1:
+            return {"status": "ok", "kept": 0, "removed": 0}
+
+        header = all_rows[0]
+        seen = set()
+        unique_rows = [header]
+        removed = 0
+        for row in all_rows[1:]:
+            ad_name = row[0].strip() if row else ""
+            if not ad_name or ad_name in seen:
+                removed += 1
+                continue
+            seen.add(ad_name)
+            has_primary = len(row) > 5 and row[5].strip()
+            if not has_primary:
+                better = None
+                for other in all_rows[1:]:
+                    if other[0].strip() == ad_name and len(other) > 5 and other[5].strip():
+                        better = other
+                        break
+                if better:
+                    row = better
+            unique_rows.append(row)
+
+        ws.clear()
+        max_cols = max(len(r) for r in unique_rows)
+        normalized = [r + [""] * (max_cols - len(r)) for r in unique_rows]
+        end_col = chr(ord("A") + max_cols - 1) if max_cols <= 26 else "Z"
+        _sheets_retry(lambda: ws.update(f"A1:{end_col}{len(normalized)}", normalized, value_input_option="USER_ENTERED"))
+
+        kept = len(unique_rows) - 1
+        msg = f"[{c}] dedup-master: kept {kept}, removed {removed} duplicates"
+        print(msg)
+        send_telegram(msg)
+        return {"status": "ok", "server_id": SERVER_ID, "kept": kept, "removed": removed}
     except Exception as e:
         traceback.print_exc()
         return {"status": "error", "message": str(e)}

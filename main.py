@@ -1907,6 +1907,33 @@ def mark_ready():
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/clear-tabs")
+def clear_tabs():
+    """Clear all USA_1..USA_5 tabs (keep headers only) so cron finds nothing."""
+    try:
+        _, gc = get_google_services()
+        ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
+        cleared = {}
+        for tab_name in DISTRIBUTE_TABS:
+            try:
+                ws = _sheets_retry(lambda t=tab_name: ss.worksheet(t))
+                rows = _sheets_retry(lambda: ws.get_all_values())
+                if len(rows) <= 1:
+                    cleared[tab_name] = 0
+                    continue
+                header = rows[0]
+                ws.clear()
+                ws.update("A1:" + chr(64 + len(header)) + "1", [header], value_input_option="USER_ENTERED")
+                cleared[tab_name] = len(rows) - 1
+            except gspread.exceptions.WorksheetNotFound:
+                cleared[tab_name] = "not found"
+            except Exception as e:
+                cleared[tab_name] = str(e)
+        return {"status": "ok", "server_id": SERVER_ID, "cleared": cleared}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/retry-errors")
 def retry_errors():
     """Scan USA_1..USA_5 tabs and reset 'error' prompts back to 'READY'."""

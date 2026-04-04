@@ -7,6 +7,7 @@ import subprocess
 import time
 import threading
 import traceback
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import openai
 import gspread
@@ -601,13 +602,12 @@ def kie_download_video(url: str, local_path: str):
 # ============================================================
 def get_prompts_for_country(gc, country_cfg, limit=5):
     prompt_tab = country_cfg["prompt_tab"]
-    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
     try:
-        ws = spreadsheet.worksheet(prompt_tab)
+        ws = _get_worksheet(gc, prompt_tab)
     except gspread.exceptions.WorksheetNotFound:
         return []
 
-    all_rows = ws.get_all_values()
+    all_rows = _sheets_retry(lambda: ws.get_all_values())
     if len(all_rows) <= 1:
         return []
 
@@ -640,29 +640,57 @@ def get_prompts_for_country(gc, country_cfg, limit=5):
 
     return prompts
 
+def _sheets_retry(func, max_retries=4):
+    """Retry a Sheets API call with exponential backoff on 429 errors."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                print(f"  [{SERVER_ID}] Sheets 429, retry {attempt+1} in {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                raise
+
+_ws_cache = {}
+_ws_cache_lock = threading.Lock()
+
+def _get_worksheet(gc, tab_name):
+    """Get a worksheet, caching the spreadsheet object to reduce API calls."""
+    with _ws_cache_lock:
+        ss = _ws_cache.get("_spreadsheet")
+        if ss is None:
+            ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
+            _ws_cache["_spreadsheet"] = ss
+        ws = _ws_cache.get(tab_name)
+        if ws is None:
+            ws = _sheets_retry(lambda: ss.worksheet(tab_name))
+            _ws_cache[tab_name] = ws
+        return ws
+
 def mark_prompt_status(gc, country_cfg, row_index, status, prompt_text=None):
     prompt_tab = country_cfg["prompt_tab"]
-    spreadsheet = gc.open_by_key(PROMPTS_SHEET_ID)
-    ws = spreadsheet.worksheet(prompt_tab)
-    headers = [h.strip().lower() for h in ws.row_values(1)]
+    ws = _get_worksheet(gc, prompt_tab)
+    headers = [h.strip().lower() for h in _sheets_retry(lambda: ws.row_values(1))]
     if "status" not in headers:
         return
     status_col = headers.index("status") + 1
 
     if prompt_text and "prompt" in headers:
         prompt_col = headers.index("prompt")
-        all_rows = ws.get_all_values()
+        all_rows = _sheets_retry(lambda: ws.get_all_values())
         found = False
         for idx, row in enumerate(all_rows[1:], start=2):
             cell_prompt = row[prompt_col].strip() if prompt_col < len(row) else ""
             if cell_prompt == prompt_text.strip():
-                ws.update_cell(idx, status_col, status)
+                _sheets_retry(lambda: ws.update_cell(idx, status_col, status))
                 found = True
                 break
         if not found:
             print(f"  [{SERVER_ID}] mark_prompt_status: prompt not found, skipping")
     else:
-        ws.update_cell(row_index, status_col, status)
+        _sheets_retry(lambda: ws.update_cell(row_index, status_col, status))
 
 # ============================================================
 # FULL PIPELINE: PARALLEL generation -> edit -> upload -> log
@@ -703,9 +731,8 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
     try:
         with sheet_lock:
             _, gc_s = get_google_services()
-            ss_check = gc_s.open_by_key(PROMPTS_SHEET_ID)
-            ws_check = ss_check.worksheet(c_cfg["prompt_tab"])
-            all_current = ws_check.get_all_values()
+            ws_check = _get_worksheet(gc_s, c_cfg["prompt_tab"])
+            all_current = _sheets_retry(lambda: ws_check.get_all_values())
             h_check = [h.strip().lower() for h in all_current[0]] if all_current else []
             prompt_col = h_check.index("prompt") if "prompt" in h_check else -1
             status_col_idx = h_check.index("status") if "status" in h_check else -1
@@ -776,8 +803,11 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
                     send_telegram(f"{country} Sheet write FAILED V{vid_index}: {str(se)[:100]}")
 
         with sheet_lock:
-            _, gc_d = get_google_services()
-            mark_prompt_status(gc_d, c_cfg, row_index, "done", prompt_text=prompt_text)
+            try:
+                _, gc_d = get_google_services()
+                mark_prompt_status(gc_d, c_cfg, row_index, "done", prompt_text=prompt_text)
+            except Exception as mark_err:
+                print(f"  [{SERVER_ID}/{country}] V{vid_index} mark done failed: {mark_err}")
 
         last_activity_time = time.time()
         send_telegram(f"{country} V{vid_index} done!")
@@ -1109,17 +1139,20 @@ def root():
         "prompt_tab": COUNTRY_CONFIG.get("USA", {}).get("prompt_tab", ""),
     }
 
-@app.get("/status")
-def status():
-    stale = round(time.time() - last_activity_time)
-    prompt_counts = {"ready": 0, "processing": 0, "done": 0, "error": 0, "total": 0}
+_prompt_cache = {"counts": {"ready": 0, "processing": 0, "done": 0, "error": 0, "total": 0}, "ts": 0}
+_PROMPT_CACHE_TTL = 30
+
+def _refresh_prompt_counts():
+    now = time.time()
+    if now - _prompt_cache["ts"] < _PROMPT_CACHE_TTL:
+        return _prompt_cache["counts"]
     try:
         _, gc = get_google_services()
         c_cfg = COUNTRY_CONFIG.get("USA", {})
+        counts = {"ready": 0, "processing": 0, "done": 0, "error": 0, "total": 0}
         if c_cfg:
-            ss = gc.open_by_key(PROMPTS_SHEET_ID)
-            ws = ss.worksheet(c_cfg["prompt_tab"])
-            all_rows = ws.get_all_values()
+            ws = _get_worksheet(gc, c_cfg["prompt_tab"])
+            all_rows = _sheets_retry(lambda: ws.get_all_values())
             if all_rows:
                 headers = [h.strip().lower() for h in all_rows[0]]
                 status_idx = headers.index("status") if "status" in headers else -1
@@ -1128,12 +1161,20 @@ def status():
                     has_prompt = prompt_idx >= 0 and prompt_idx < len(r) and r[prompt_idx].strip()
                     if not has_prompt:
                         continue
-                    prompt_counts["total"] += 1
+                    counts["total"] += 1
                     st = r[status_idx].strip().lower() if status_idx >= 0 and status_idx < len(r) else ""
                     if st in ("ready", "processing", "done", "error"):
-                        prompt_counts[st] += 1
+                        counts[st] += 1
+        _prompt_cache["counts"] = counts
+        _prompt_cache["ts"] = now
     except Exception:
         pass
+    return _prompt_cache["counts"]
+
+@app.get("/status")
+def status():
+    stale = round(time.time() - last_activity_time)
+    prompt_counts = _refresh_prompt_counts()
     return {
         "server_id": SERVER_ID,
         "processing": is_processing,
@@ -1477,14 +1518,14 @@ def distribute_prompts():
     """Read READY prompts from 'USA' tab and distribute them round-robin to USA_1..USA_5."""
     try:
         _, gc = get_google_services()
-        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
 
         try:
-            source_ws = ss.worksheet("USA")
+            source_ws = _sheets_retry(lambda: ss.worksheet("USA"))
         except gspread.exceptions.WorksheetNotFound:
             return {"status": "error", "message": "Source tab 'USA' not found"}
 
-        all_rows = source_ws.get_all_values()
+        all_rows = _sheets_retry(lambda: source_ws.get_all_values())
         if len(all_rows) <= 1:
             return {"status": "ok", "distributed": 0, "message": "No rows in USA tab"}
 
@@ -1567,13 +1608,13 @@ def mark_ready():
     """Scan the source 'USA' tab and set STATUS=READY on rows that have a prompt but no status."""
     try:
         _, gc = get_google_services()
-        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
         try:
-            ws = ss.worksheet("USA")
+            ws = _sheets_retry(lambda: ss.worksheet("USA"))
         except gspread.exceptions.WorksheetNotFound:
             return {"status": "error", "message": "Tab 'USA' not found"}
 
-        all_rows = ws.get_all_values()
+        all_rows = _sheets_retry(lambda: ws.get_all_values())
         if len(all_rows) <= 1:
             return {"status": "ok", "marked": 0}
 
@@ -1593,7 +1634,7 @@ def mark_ready():
 
         marked = len(cells_to_update)
         if cells_to_update:
-            ws.update_cells(cells_to_update)
+            _sheets_retry(lambda: ws.update_cells(cells_to_update))
 
         send_telegram(f"Marked {marked} prompts as READY in USA tab")
         return {"status": "ok", "server_id": SERVER_ID, "marked": marked}
@@ -1608,19 +1649,19 @@ def retry_errors():
     """Scan USA_1..USA_5 tabs and reset 'error' prompts back to 'READY'."""
     try:
         _, gc = get_google_services()
-        ss = gc.open_by_key(PROMPTS_SHEET_ID)
+        ss = _sheets_retry(lambda: gc.open_by_key(PROMPTS_SHEET_ID))
 
         total_retried = 0
         per_tab = {}
 
         for tab_name in DISTRIBUTE_TABS:
             try:
-                ws = ss.worksheet(tab_name)
+                ws = _sheets_retry(lambda: ss.worksheet(tab_name))
             except gspread.exceptions.WorksheetNotFound:
                 per_tab[tab_name] = 0
                 continue
 
-            all_rows = ws.get_all_values()
+            all_rows = _sheets_retry(lambda: ws.get_all_values())
             if len(all_rows) <= 1:
                 per_tab[tab_name] = 0
                 continue
@@ -1639,7 +1680,7 @@ def retry_errors():
                     cells_to_update.append(gspread.Cell(row=idx, col=status_col, value="READY"))
 
             if cells_to_update:
-                ws.update_cells(cells_to_update)
+                _sheets_retry(lambda: ws.update_cells(cells_to_update))
 
             per_tab[tab_name] = len(cells_to_update)
             total_retried += len(cells_to_update)

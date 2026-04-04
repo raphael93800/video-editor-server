@@ -1101,7 +1101,7 @@ def recover_stuck_processing():
 # CRON
 # ============================================================
 CRON_INTERVAL = int(os.environ.get("CRON_INTERVAL", "60"))
-cron_enabled = os.environ.get("CRON_ENABLED", "true").lower() == "true"
+cron_enabled = os.environ.get("CRON_ENABLED", "false").lower() == "true"
 
 def has_ready_prompts():
     try:

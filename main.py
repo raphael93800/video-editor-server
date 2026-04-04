@@ -1499,6 +1499,70 @@ def dedup_master(country: str = "USA"):
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/clean-drive")
+def clean_drive(country: str = "USA", date: str = None):
+    """Remove duplicate video files from the Drive 'edited' folder, keeping only one per base name."""
+    c = country.upper()
+    if c not in COUNTRY_CONFIG:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    c_cfg = COUNTRY_CONFIG[c]
+    if not date:
+        date = datetime.datetime.now().strftime("%d.%m")
+
+    try:
+        drive_svc, _ = get_google_services()
+        results_folder_id = c_cfg["results_folder_id"]
+
+        q = f"'{results_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{date}'"
+        date_folders = drive_svc.files().list(q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+        if not date_folders:
+            return {"status": "error", "message": f"No folder {date} in Drive"}
+        date_folder_id = date_folders[0]["id"]
+
+        sub_q = f"'{date_folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+        subs = drive_svc.files().list(q=sub_q, fields="files(id,name)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+
+        total_deleted = 0
+        total_kept = 0
+        folder_details = {}
+
+        for folder_name in ["edited", "original"]:
+            folder_id = next((f["id"] for f in subs if f["name"] == folder_name), None)
+            if not folder_id:
+                continue
+
+            all_files = drive_list_all_files(drive_svc, folder_id)
+            seen = {}
+            duplicates = []
+
+            for f in sorted(all_files, key=lambda x: x["name"]):
+                name = f["name"]
+                if name in seen:
+                    duplicates.append(f["id"])
+                else:
+                    seen[name] = f["id"]
+
+            for fid in duplicates:
+                try:
+                    drive_svc.files().delete(fileId=fid, supportsAllDrives=True).execute()
+                except Exception as e:
+                    print(f"  [{SERVER_ID}] Failed to delete {fid}: {e}")
+
+            total_deleted += len(duplicates)
+            total_kept += len(seen)
+            folder_details[folder_name] = {"kept": len(seen), "deleted": len(duplicates)}
+
+        msg = f"[{c}] clean-drive {date}: kept {total_kept}, deleted {total_deleted} duplicates"
+        print(msg)
+        send_telegram(msg)
+        return {"status": "ok", "server_id": SERVER_ID, "date": date,
+                "total_kept": total_kept, "total_deleted": total_deleted,
+                "folders": folder_details}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/rebuild-master")
 def rebuild_master(country: str = "USA"):
     """Fill missing Primary_Text, Headline, Video_Prompt from all prompt tabs (USA + USA_1..5)."""

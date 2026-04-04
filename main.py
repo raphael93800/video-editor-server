@@ -370,7 +370,7 @@ def build_subtitle_drawtext_filters(srt_path, font_path):
 # ============================================================
 # EDIT A SINGLE VIDEO (thread-safe temp files via UUID prefix)
 # ============================================================
-edit_semaphore = threading.Semaphore(2)
+edit_semaphore = threading.Semaphore(1)
 
 def edit_single_video(local_hook_raw, local_part2_clean, metadata, country, vid_index):
     uid = uuid.uuid4().hex[:8]

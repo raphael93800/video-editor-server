@@ -580,8 +580,14 @@ def kie_poll_video(task_id: str, max_wait=600, interval=15) -> str:
                     print(f"  [{SERVER_ID}] kie.ai video ready: {urls[0][:80]}...")
                     return urls[0]
                 raise Exception("kie.ai returned success but no resultUrls")
-            elif flag in (2, 3):
+            elif flag == 2:
                 err = data["data"].get("errorMessage", "unknown error")
+                raise Exception(f"kie.ai generation failed (flag={flag}): {err}")
+            elif flag == 3:
+                err = data["data"].get("errorMessage", "unknown error")
+                if "internal" in err.lower() or "try again" in err.lower():
+                    print(f"  [{SERVER_ID}] kie.ai internal error, will retry generate...")
+                    raise Exception(f"kie.ai_retry: {err}")
                 raise Exception(f"kie.ai generation failed (flag={flag}): {err}")
 
             print(f"  [{SERVER_ID}] kie.ai generating... ({elapsed}s / {max_wait}s)")
@@ -758,8 +764,19 @@ def _process_single_prompt(p_data, country, c_cfg, date_str, vid_index,
 
         print(f"  [{SERVER_ID}/{country}] V{vid_index}: generating...")
 
-        task_id = kie_generate_video(prompt_text)
-        video_url = kie_poll_video(task_id)
+        video_url = None
+        for kie_attempt in range(3):
+            try:
+                task_id = kie_generate_video(prompt_text)
+                video_url = kie_poll_video(task_id)
+                break
+            except Exception as kie_err:
+                if "kie.ai_retry" in str(kie_err) and kie_attempt < 2:
+                    wait = (kie_attempt + 1) * 15
+                    print(f"  [{SERVER_ID}/{country}] V{vid_index}: kie.ai retry {kie_attempt+1} in {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
         last_activity_time = time.time()
 
         kie_download_video(video_url, local_raw)

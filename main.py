@@ -1120,15 +1120,20 @@ def cron_loop():
 @app.on_event("startup")
 def start_cron():
     print(f"[{SERVER_ID}] Server starting up...")
-    try:
-        recover_stuck_processing()
-    except Exception as e:
-        print(f"[{SERVER_ID}] Startup recovery error: {e}")
+
+    def delayed_startup():
+        time.sleep(30)
+        try:
+            recover_stuck_processing()
+        except Exception as e:
+            print(f"[{SERVER_ID}] Startup recovery error: {e}")
+        if cron_enabled:
+            cron_loop()
 
     if cron_enabled:
-        t = threading.Thread(target=cron_loop, daemon=True)
+        t = threading.Thread(target=delayed_startup, daemon=True)
         t.start()
-        print(f"[{SERVER_ID}] Cron thread started (every {CRON_INTERVAL}s)")
+        print(f"[{SERVER_ID}] Cron thread will start in 30s (every {CRON_INTERVAL}s)")
     else:
         print(f"[{SERVER_ID}] Cron disabled")
 

@@ -1191,7 +1191,7 @@ def auto_recovery_loop():
                     threading.Thread(target=full_pipeline, args=("USA",), daemon=True).start()
 
             now = time.time()
-            if now - last_progress_report >= PROGRESS_REPORT_INTERVAL:
+            if is_processing and now - last_progress_report >= PROGRESS_REPORT_INTERVAL:
                 last_progress_report = now
                 counts = _refresh_prompt_counts()
                 total = counts.get("total", 0)
@@ -1199,7 +1199,7 @@ def auto_recovery_loop():
                 error = counts.get("error", 0)
                 ready = counts.get("ready", 0)
                 processing = counts.get("processing", 0)
-                if total > 0:
+                if total > 0 and (ready > 0 or processing > 0):
                     pct = round(done / total * 100)
                     bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
                     send_telegram(

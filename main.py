@@ -2269,6 +2269,34 @@ def retry_errors():
         return {"status": "error", "message": str(e)}
 
 
+@app.get("/export-links")
+def export_links(country: str = "USA", start: int = 1, end: int = 9999):
+    """Return Ad_Name + Direct_Download_Link for rows in the master sheet."""
+    c = country.upper()
+    c_cfg = COUNTRY_CONFIG.get(c)
+    if not c_cfg:
+        return JSONResponse({"status": "error", "message": f"Unknown country: {c}"}, status_code=400)
+    try:
+        _, gc = get_google_services()
+        mws = get_or_create_master_tab(gc, c_cfg["master_tab"])
+        rows = mws.get_all_values()
+        if not rows:
+            return {"status": "ok", "links": []}
+        headers = [h.strip() for h in rows[0]]
+        name_idx = headers.index("Ad_Name") if "Ad_Name" in headers else 0
+        dl_idx = headers.index("Direct_Download_Link") if "Direct_Download_Link" in headers else 2
+        links = []
+        for i in range(max(start, 1), min(end + 1, len(rows))):
+            row = rows[i]
+            name = row[name_idx] if name_idx < len(row) else ""
+            link = row[dl_idx] if dl_idx < len(row) else ""
+            if link:
+                links.append({"name": name, "link": link, "row": i + 1})
+        return {"status": "ok", "total": len(links), "links": links}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
